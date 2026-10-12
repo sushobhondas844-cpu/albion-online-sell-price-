@@ -95,7 +95,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         worksheet = spreadsheet.add_worksheet(title=server_name, rows="100", cols="25")
         raw_items = []
         
-    # --- BUG FIX: Stop reading when we hit the summary section ---
     items_to_track = []
     for i in raw_items:
         val = i.strip()
@@ -118,20 +117,17 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     if not target_ids:
         return
         
-    # Fetch Data from BOTH Endpoints
     price_data = fetch_live_prices(target_ids, server=server_code)
     history_data = fetch_history_volume(target_ids, server=server_code)
     
-    # Process Live Prices
-    live_market = {} # (internal_id, city) -> {'buy': max_buy, 'sell': min_sell}
+    live_market = {} 
     for p in price_data:
         uid = p.get("item_id")
         city = p.get("city")
         if (uid, city) not in live_market:
             live_market[(uid, city)] = {'buy': p.get("buy_price_max", 0), 'sell': p.get("sell_price_min", 0)}
             
-    # Process Volume
-    volume_market = {} # (internal_id, city) -> vol
+    volume_market = {} 
     for h in history_data:
         uid = h.get("item_id")
         city = h.get("location")
@@ -139,7 +135,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         vol = data[-1].get("item_count", 0) if data else 0
         volume_market[(uid, city)] = vol
         
-    # Calculate Best Routes (Factoring in 10.5% Tax)
     best_routes = []
     for item in items_to_track:
         uid = parse_item_name(item, global_mapping)
@@ -161,10 +156,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     best_df = pd.DataFrame(best_routes, columns=["Item", "Buy At", "Live Buy Cost", "Sell At", "Live Sell Value", "Net Profit (After Tax)", "Daily Vol"])
     best_df = best_df.sort_values(by="Net Profit (After Tax)", ascending=False)
     
-    # --- BUILD THE GRID ---
-    # Row 1: Item Name, City1 (spanning 3 cols), City2...
     header_row_1 = ["Item Name"]
-    # Row 2: [Blank], Buy Order, Sell Order, Volume...
     header_row_2 = [""]
     
     for city in CITIES:
@@ -173,7 +165,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         
     final_data = [header_row_1, header_row_2]
     
-    # Append the item rows
     for item in items_to_track: 
         uid = parse_item_name(item, global_mapping)
         row = [item]
@@ -184,14 +175,12 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             row.extend([buy_order, sell_order, vol])
         final_data.append(row)
         
-    # Append Best Routes
     final_data.append([])
     final_data.append(["--- BEST ROUTES SUMMARY ---"])
     final_data.append(list(best_df.columns))
     best_df_clean = best_df.astype(object).where(pd.notnull(best_df), None)
     final_data.extend(best_df_clean.values.tolist())
         
-    # Clear and write all data at once
     worksheet.clear()
     worksheet.clear_basic_filter()
     worksheet.update(values=final_data, range_name='A1')
@@ -199,7 +188,18 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     # --- APPLY STYLING ---
     requests_payload = []
     
-    # 1. Merge City Header Cells (Spanning 3 columns now)
+    # 0. FIX: Unmerge all existing cells in the header area first to clear the old 2-column layout
+    requests_payload.append({
+        "unmergeCells": {
+            "range": {
+                "sheetId": worksheet.id,
+                "startRowIndex": 0, "endRowIndex": 2,
+                "startColumnIndex": 0, "endColumnIndex": 50
+            }
+        }
+    })
+    
+    # 1. Merge City Header Cells (Spanning 3 columns)
     col_idx = 1
     for city in CITIES:
         requests_payload.append({
@@ -217,14 +217,12 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     if requests_payload:
         spreadsheet.batch_update({"requests": requests_payload})
         
-    # 2. Format Header Rows (Bold, Centered)
     end_col = col_to_letter(1 + (len(CITIES) * 3))
     format_cell_range(worksheet, f'A1:{end_col}2', cellFormat(
         textFormat=textFormat(bold=True),
         horizontalAlignment='CENTER'
     ))
     
-    # 3. Apply Faction Colors to City Headers
     col_idx = 2
     for city in CITIES:
         bg_color = CITY_COLORS.get(city, color(1.0, 1.0, 1.0))
@@ -233,7 +231,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         format_cell_range(worksheet, f'{letter1}1:{letter2}{len(items_to_track)+2}', cellFormat(backgroundColor=bg_color))
         col_idx += 3
         
-    # 4. Color Code The Resource Rows
     current_row = 3
     for item in items_to_track:
         row_color = get_row_color(item)
