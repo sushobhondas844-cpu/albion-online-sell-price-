@@ -16,7 +16,7 @@ ITEMS_TO_TRACK = [
     "tier 2 ore",
     "tier 3 log",
     "tier 8 log",
-    "tire 3 leather"
+    "tier 3 leather"
 ]
 
 # Add or remove any cities here. The sheet will automatically adjust columns.
