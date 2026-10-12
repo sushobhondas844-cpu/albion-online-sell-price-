@@ -132,7 +132,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         for idx, val in enumerate(headers2):
             if headers1[idx]: curr_city = headers1[idx]
             if curr_city and curr_city in city_cols:
-                # Updated to look for explicit Order headers
                 if "Buy Order" in val: city_cols[curr_city]['buy'] = idx
                 if "Sell Order" in val: city_cols[curr_city]['sell'] = idx
 
@@ -146,13 +145,17 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             for city, cols in city_cols.items():
                 b_idx = cols['buy']
                 s_idx = cols['sell']
-                b_val = row[b_idx].strip() if b_idx is not None and b_idx < len(row) else ""
-                s_val = row[s_idx].strip() if s_idx is not None and s_idx < len(row) else ""
+                b_val_str = row[b_idx].strip() if b_idx is not None and b_idx < len(row) else ""
+                s_val_str = row[s_idx].strip() if s_idx is not None and s_idx < len(row) else ""
                 
-                b_num = int(re.sub(r'[^\d]', '', b_val)) if re.sub(r'[^\d]', '', b_val) else 0
-                s_num = int(re.sub(r'[^\d]', '', s_val)) if re.sub(r'[^\d]', '', s_val) else 0
+                # Keep original string to paste back safely, create int for math
+                b_num = int(re.sub(r'[^\d]', '', b_val_str)) if re.sub(r'[^\d]', '', b_val_str) else 0
+                s_num = int(re.sub(r'[^\d]', '', s_val_str)) if re.sub(r'[^\d]', '', s_val_str) else 0
                 
-                custom_inputs[(item_name, city)] = {'buy': b_num, 'sell': s_num}
+                custom_inputs[(item_name, city)] = {
+                    'buy_num': b_num, 'sell_num': s_num,
+                    'buy_str': b_val_str, 'sell_str': s_val_str
+                }
                 
     # 2. FETCH API DATA
     target_ids = []
@@ -218,10 +221,10 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             elif profit_from_c > 0:
                 api_caerleon_routes.append([item, "Caerleon", c_price, best_safe_sell, safe_sell_price, profit_from_c, safe_sell_vol, "API Avg"])
 
-        # --- HYBRID CUSTOM ROUTES ---
+        # --- HYBRID CUSTOM ROUTES (Enforced Priority) ---
         has_custom = False
         for c in CITIES:
-            if custom_inputs.get((item, c), {}).get('buy', 0) > 0 or custom_inputs.get((item, c), {}).get('sell', 0) > 0:
+            if custom_inputs.get((item, c), {}).get('buy_num', 0) > 0 or custom_inputs.get((item, c), {}).get('sell_num', 0) > 0:
                 has_custom = True
                 break
                 
@@ -234,18 +237,21 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                 for s_city in CITIES:
                     if b_city == s_city: continue
                     
-                    c_buy = custom_inputs.get((item, b_city), {}).get('buy', 0)
-                    c_sell = custom_inputs.get((item, s_city), {}).get('sell', 0)
+                    # You pay the market's Sell Order to acquire the item
+                    market_sell_order_at_buy_city = custom_inputs.get((item, b_city), {}).get('sell_num', 0)
                     
-                    if c_buy == 0 and c_sell == 0: continue
+                    # You receive the market's Buy Order when liquidating the item
+                    market_buy_order_at_sell_city = custom_inputs.get((item, s_city), {}).get('buy_num', 0)
+                    
+                    if market_sell_order_at_buy_city == 0 and market_buy_order_at_sell_city == 0: continue
                     
                     avg_buy = market_data.get((uid, b_city), {}).get('price', 0)
                     avg_sell = market_data.get((uid, s_city), {}).get('price', 0)
                     s_vol = market_data.get((uid, s_city), {}).get('volume', 0)
                     
-                    is_true_pair = (c_buy > 0 and c_sell > 0)
-                    actual_buy = c_buy if c_buy > 0 else avg_buy
-                    actual_sell = c_sell if c_sell > 0 else avg_sell
+                    is_true_pair = (market_sell_order_at_buy_city > 0 and market_buy_order_at_sell_city > 0)
+                    actual_buy = market_sell_order_at_buy_city if market_sell_order_at_buy_city > 0 else avg_buy
+                    actual_sell = market_buy_order_at_sell_city if market_buy_order_at_sell_city > 0 else avg_sell
                     
                     if actual_buy == 0 or actual_sell == 0 or s_vol == 0: continue
                     profit = int((actual_sell * 0.895) - actual_buy)
@@ -262,10 +268,10 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                     if should_update:
                         best_custom_profit = profit
                         notes = []
-                        if c_buy == 0: notes.append(f"Avg Buy ({b_city})")
-                        else: notes.append(f"Custom Buy Order ({b_city})")
-                        if c_sell == 0: notes.append(f"Avg Sell ({s_city})")
-                        else: notes.append(f"Custom Sell Order ({s_city})")
+                        if market_sell_order_at_buy_city == 0: notes.append(f"Avg Price ({b_city})")
+                        else: notes.append(f"Custom Sell Order ({b_city})")
+                        if market_buy_order_at_sell_city == 0: notes.append(f"Avg Price ({s_city})")
+                        else: notes.append(f"Custom Buy Order ({s_city})")
                         
                         note_str = "PRIORITY: Custom Orders" if is_true_pair else " + ".join(notes)
                         best_custom_route = [item, b_city, actual_buy, s_city, actual_sell, profit, s_vol, note_str]
@@ -276,7 +282,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                 else:
                     custom_safe_routes.append(best_custom_route)
 
-    # 4. BUILD THE GRID
+    # 4. BUILD THE GRID 
     route_columns = ["Item", "Buy At", "Buy Price", "Sell At", "Sell Price", "Net Profit (After Tax)", "Daily Vol", "Type / Notes"]
     
     caerleon_all = custom_caerleon_routes + api_caerleon_routes
@@ -294,7 +300,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     header_row_1 = ["Item Name"]
     header_row_2 = [""]
     
-    # Updated headers to explicitly read "Custom Buy Order" and "Custom Sell Order"
     for city in CITIES:
         header_row_1.extend([city, "", "", ""])
         header_row_2.extend(["Avg Price", "Volume", "Custom Buy Order", "Custom Sell Order"])
@@ -307,11 +312,10 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         for city in CITIES:
             price = market_data.get((uid, city), {}).get("price", 0)
             vol = market_data.get((uid, city), {}).get("volume", 0)
-            c_buy = custom_inputs.get((item, city), {}).get('buy', 0)
-            c_sell = custom_inputs.get((item, city), {}).get('sell', 0)
             
-            c_buy_str = c_buy if c_buy > 0 else ""
-            c_sell_str = c_sell if c_sell > 0 else ""
+            # Injecting the raw string you typed directly back in to prevent data deletion
+            c_buy_str = custom_inputs.get((item, city), {}).get('buy_str', "")
+            c_sell_str = custom_inputs.get((item, city), {}).get('sell_str', "")
             
             row.extend([price, vol, c_buy_str, c_sell_str])
         final_data.append(row)
@@ -328,11 +332,14 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     append_table("--- SAFE CITIES API ROUTES (Top 5) ---", safe_df)
     append_table("--- CAERLEON (RED ZONE) API ROUTES (Top 5) ---", caerleon_df)
         
-    worksheet.clear()
-    worksheet.clear_basic_filter()
-    worksheet.update(values=final_data, range_name='A1')
+    # 5. WRITE DATA NON-DESTRUCTIVELY
+    # Replaces the dangerous worksheet.clear() with a precise, targeted update that leaves your inputs intact
+    worksheet.update(values=final_data, range_name='A1', value_input_option='USER_ENTERED')
     
-    # 5. BATCH FORMATTING
+    new_row_count = len(final_data)
+    worksheet.batch_clear([f'A{new_row_count + 1}:Z1000'])
+    
+    # 6. BATCH FORMATTING
     requests_payload = [{"unmergeCells": {"range": {"sheetId": worksheet.id, "startRowIndex": 0, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 50}}}]
     
     col_idx = 1
