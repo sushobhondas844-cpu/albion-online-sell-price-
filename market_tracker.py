@@ -9,8 +9,7 @@ from datetime import datetime
 import re
 
 # ==========================================
-# MODULE 1: CONFIGURATION & STYLING
-# Description: Defines the core variables, tracked items, and color palettes.
+# MODULE 1: CONFIGURATION AND STYLING
 # ==========================================
 CITIES = ["Martlock", "Caerleon", "Lymhurst", "Bridgewatch", "Thetford", "Fort Sterling"]
 SHEET_NAME = "Albion Market Tracker"
@@ -42,7 +41,6 @@ RESOURCE_COLORS = {
 
 # ==========================================
 # MODULE 2: HELPER UTILITIES
-# Description: Handles ID mapping, color assignments, and math calculations.
 # ==========================================
 def generate_tracking_list():
     generated = []
@@ -105,7 +103,6 @@ def fetch_history_data(item_ids, server):
     return res.json() if res.status_code == 200 else []
 
 def calculate_sell_viability(profit, buy_price, vol):
-    """Calculates the mathematical probability of a sell order filling without undercutting risk."""
     if buy_price <= 0: return "Unknown"
     margin_pct = (profit / buy_price) * 100
     if vol < 100: return "Low (High Undercut Risk)"
@@ -115,7 +112,6 @@ def calculate_sell_viability(profit, buy_price, vol):
 
 # ==========================================
 # MODULE 3: GOOGLE SHEETS PROCESSING
-# Description: Reads sheet, computes Albion economics logic, non-destructively writes data, applies batch formatting.
 # ==========================================
 def update_server_tab(client, spreadsheet, server_name, server_code, global_mapping):
     try:
@@ -125,7 +121,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         worksheet = spreadsheet.add_worksheet(title=server_name, rows="300", cols="30")
         existing_data = []
 
-    # 1. PARSE EXISTING ITEMS AND CUSTOM USER INPUTS (Non-Destructive Read)
     items_to_track = generate_tracking_list()
     custom_inputs = {} 
     
@@ -136,7 +131,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         city_cols = {}
         curr_city = None
         for idx, val in enumerate(headers1):
-            if val and val not in ["Item Name", ""] and "---" not in val:
+            if val and val not in ["Item Name", ""] and "***" not in val and "===" not in val:
                 curr_city = val
                 city_cols[curr_city] = {'buy': None, 'sell': None}
                 
@@ -149,7 +144,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
 
         for row in existing_data[2:]:
             item_name = row[0].strip()
-            if not item_name or "---" in item_name: break
+            if not item_name or "***" in item_name or "===" in item_name: break
             if item_name not in items_to_track:
                 items_to_track.append(item_name)
                 
@@ -167,7 +162,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                     'buy_str': b_val_str, 'sell_str': s_val_str
                 }
                 
-    # 2. FETCH API DATA
     target_ids = []
     for item in items_to_track:
         internal_id = parse_item_name(item, global_mapping)
@@ -184,29 +178,44 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             latest = data[-1]
             market_data[(uid, city)] = {'price': latest.get("avg_price", 0), 'volume': latest.get("item_count", 0)}
 
-    # 3. CALCULATE ROUTES
     api_safe_routes = []
     api_caerleon_routes = []
     custom_safe_routes = []
     custom_caerleon_routes = []
+    safe_liquidations = []
+    caerleon_liquidations = []
     
     for item in items_to_track:
         uid = parse_item_name(item, global_mapping)
         valid_cities = [c for c in CITIES if market_data.get((uid, c), {}).get("price", 0) > 0 and market_data.get((uid, c), {}).get("volume", 0) > 0]
         safe_cities = [c for c in valid_cities if c != "Caerleon"]
         
-        # Calculate Best Liquidation City (Highest Buy Order) for this item
-        best_sell_city = ""
-        best_sell_price = 0
-        for c in CITIES:
-            s_price = custom_inputs.get((item, c), {}).get('buy_num', 0)
-            if s_price == 0: s_price = market_data.get((uid, c), {}).get('price', 0)
-            if s_price > best_sell_price:
-                best_sell_price = s_price
-                best_sell_city = c
-        best_liquidation_string = f"{best_sell_city} ({best_sell_price})" if best_sell_price > 0 else "None"
+        best_safe_sell_city = ""
+        best_safe_sell_price = 0
+        best_safe_source = ""
+        best_safe_api_avg = 0
+        
+        for c in safe_cities:
+            api_avg = market_data.get((uid, c), {}).get('price', 0)
+            c_buy = custom_inputs.get((item, c), {}).get('buy_num', 0)
+            check_price = c_buy if c_buy > 0 else api_avg
+            
+            if check_price > best_safe_sell_price:
+                best_safe_sell_price = check_price
+                best_safe_sell_city = c
+                best_safe_source = "Custom Buy Order" if c_buy > 0 else "API Avg"
+                best_safe_api_avg = api_avg
+                
+        if best_safe_sell_price > 0:
+            safe_liquidations.append([item, best_safe_sell_city, best_safe_sell_price, best_safe_source, best_safe_api_avg])
+            
+        if "Caerleon" in valid_cities:
+            api_avg = market_data.get((uid, "Caerleon"), {}).get('price', 0)
+            c_buy = custom_inputs.get((item, "Caerleon"), {}).get('buy_num', 0)
+            best_c_price = c_buy if c_buy > 0 else api_avg
+            source = "Custom Buy Order" if c_buy > 0 else "API Avg"
+            caerleon_liquidations.append([item, "Caerleon", best_c_price, source, api_avg])
 
-        # --- API SAFE ROUTES ---
         if len(safe_cities) >= 2:
             buy_city = min(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
             sell_city = max(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
@@ -217,9 +226,8 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             
             if profit > 0:
                 viability = calculate_sell_viability(profit, buy_price, vol)
-                api_safe_routes.append([item, buy_city, buy_price, sell_city, sell_price, profit, vol, viability, best_liquidation_string, "API Avg"])
+                api_safe_routes.append([item, buy_city, buy_price, sell_city, sell_price, profit, vol, viability, "API Avg"])
                 
-        # --- API CAERLEON ROUTES ---
         if "Caerleon" in valid_cities and len(safe_cities) >= 1:
             c_price = market_data.get((uid, "Caerleon"), {}).get("price", 0)
             c_vol = market_data.get((uid, "Caerleon"), {}).get("volume", 0)
@@ -235,12 +243,11 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             
             if profit_to_c > 0 and profit_to_c >= profit_from_c:
                 viability = calculate_sell_viability(profit_to_c, safe_buy_price, c_vol)
-                api_caerleon_routes.append([item, best_safe_buy, safe_buy_price, "Caerleon", c_price, profit_to_c, c_vol, viability, best_liquidation_string, "API Avg"])
+                api_caerleon_routes.append([item, best_safe_buy, safe_buy_price, "Caerleon", c_price, profit_to_c, c_vol, viability, "API Avg"])
             elif profit_from_c > 0:
                 viability = calculate_sell_viability(profit_from_c, c_price, safe_sell_vol)
-                api_caerleon_routes.append([item, "Caerleon", c_price, best_safe_sell, safe_sell_price, profit_from_c, safe_sell_vol, viability, best_liquidation_string, "API Avg"])
+                api_caerleon_routes.append([item, "Caerleon", c_price, best_safe_sell, safe_sell_price, profit_from_c, safe_sell_vol, viability, "API Avg"])
 
-        # --- HYBRID CUSTOM ROUTES (Enforced Priority) ---
         has_custom = False
         for c in CITIES:
             if custom_inputs.get((item, c), {}).get('buy_num', 0) > 0 or custom_inputs.get((item, c), {}).get('sell_num', 0) > 0:
@@ -256,26 +263,22 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                 for s_city in CITIES:
                     if b_city == s_city: continue
                     
-                    # ALBION TRADING LOGIC:
-                    # Acquisition Cost = The Custom Sell Order (what the market is selling it for)
-                    market_sell_order_at_buy_city = custom_inputs.get((item, b_city), {}).get('sell_num', 0)
-                    # Gross Revenue = The Custom Buy Order (what the market is buying it for)
-                    market_buy_order_at_sell_city = custom_inputs.get((item, s_city), {}).get('buy_num', 0)
+                    market_sell_order = custom_inputs.get((item, b_city), {}).get('sell_num', 0)
+                    market_buy_order = custom_inputs.get((item, s_city), {}).get('buy_num', 0)
                     
-                    if market_sell_order_at_buy_city == 0 and market_buy_order_at_sell_city == 0: continue
+                    if market_sell_order == 0 and market_buy_order == 0: continue
                     
                     avg_buy = market_data.get((uid, b_city), {}).get('price', 0)
                     avg_sell = market_data.get((uid, s_city), {}).get('price', 0)
                     s_vol = market_data.get((uid, s_city), {}).get('volume', 0)
                     
-                    is_true_pair = (market_sell_order_at_buy_city > 0 and market_buy_order_at_sell_city > 0)
-                    actual_buy = market_sell_order_at_buy_city if market_sell_order_at_buy_city > 0 else avg_buy
-                    actual_sell = market_buy_order_at_sell_city if market_buy_order_at_sell_city > 0 else avg_sell
+                    is_true_pair = (market_sell_order > 0 and market_buy_order > 0)
+                    actual_buy = market_sell_order if market_sell_order > 0 else avg_buy
+                    actual_sell = market_buy_order if market_buy_order > 0 else avg_sell
                     
                     if actual_buy == 0 or actual_sell == 0 or s_vol == 0: continue
                     profit = int((actual_sell * 0.895) - actual_buy)
                     
-                    # Filter out negative profits unless the user manually paired both cities
                     if profit < 0 and not is_true_pair: continue
                     
                     should_update = False
@@ -290,14 +293,14 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                     if should_update:
                         best_custom_profit = profit
                         notes = []
-                        if market_sell_order_at_buy_city == 0: notes.append(f"Avg Price ({b_city})")
-                        else: notes.append(f"Custom Sell Order ({b_city})")
-                        if market_buy_order_at_sell_city == 0: notes.append(f"Avg Price ({s_city})")
-                        else: notes.append(f"Custom Buy Order ({s_city})")
+                        if market_sell_order == 0: notes.append(f"Avg Price {b_city}")
+                        else: notes.append(f"Custom Sell Order {b_city}")
+                        if market_buy_order == 0: notes.append(f"Avg Price {s_city}")
+                        else: notes.append(f"Custom Buy Order {s_city}")
                         
                         note_str = "PRIORITY: Custom Orders" if is_true_pair else " + ".join(notes)
                         viability = calculate_sell_viability(profit, actual_buy, s_vol)
-                        best_custom_route = [item, b_city, actual_buy, s_city, actual_sell, profit, s_vol, viability, best_liquidation_string, note_str]
+                        best_custom_route = [item, b_city, actual_buy, s_city, actual_sell, profit, s_vol, viability, note_str]
                         
             if best_custom_route:
                 if best_custom_route[1] == "Caerleon" or best_custom_route[3] == "Caerleon":
@@ -305,8 +308,8 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                 else:
                     custom_safe_routes.append(best_custom_route)
 
-    # 4. BUILD THE GRID 
-    route_columns = ["Item", "Buy At", "Buy Price", "Sell At", "Sell Price", "Net Profit", "Daily Vol", "Sell Viability", "Best Liquidation", "Type / Notes"]
+    route_columns = ["Item", "Buy At", "Buy Price", "Sell At", "Sell Price", "Net Profit", "Daily Vol", "Sell Viability", "Type / Notes"]
+    liq_columns = ["Item", "Best City to Sell", "Highest Buy Order (Revenue)", "Data Source", "API Avg Price"]
     
     caerleon_all = custom_caerleon_routes + api_caerleon_routes
     caerleon_df = pd.DataFrame(caerleon_all, columns=route_columns)
@@ -319,6 +322,9 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         custom_df = pd.DataFrame(custom_safe_routes, columns=route_columns).sort_values(by="Net Profit", ascending=False)
     else:
         custom_df = safe_df.copy()
+        
+    safe_liq_df = pd.DataFrame(safe_liquidations, columns=liq_columns).sort_values(by="Highest Buy Order (Revenue)", ascending=False).head(10)
+    caerleon_liq_df = pd.DataFrame(caerleon_liquidations, columns=liq_columns).sort_values(by="Highest Buy Order (Revenue)", ascending=False).head(10)
     
     header_row_1 = ["Item Name"]
     header_row_2 = [""]
@@ -336,7 +342,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             price = market_data.get((uid, city), {}).get("price", 0)
             vol = market_data.get((uid, city), {}).get("volume", 0)
             
-            # Non-Destructive Memory: Injecting the raw string you typed directly back in
             c_buy_str = custom_inputs.get((item, city), {}).get('buy_str', "")
             c_sell_str = custom_inputs.get((item, city), {}).get('sell_str', "")
             
@@ -351,18 +356,17 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         clean_df = df.astype(object).where(pd.notnull(df), None)
         final_data.extend(clean_df.values.tolist())
 
-    append_table("--- CUSTOM USER ROUTES (Hybrid) ---", custom_df)
-    append_table("--- SAFE CITIES API ROUTES (Top 5) ---", safe_df)
-    append_table("--- CAERLEON (RED ZONE) API ROUTES (Top 5) ---", caerleon_df)
+    append_table("=== CUSTOM USER ROUTES (Hybrid) ===", custom_df)
+    append_table("=== SAFE CITIES API ROUTES (Top 5) ===", safe_df)
+    append_table("=== CAERLEON (RED ZONE) API ROUTES (Top 5) ===", caerleon_df)
+    append_table("=== BEST LIQUIDATION: SAFE CITIES ===", safe_liq_df)
+    append_table("=== BEST LIQUIDATION: CAERLEON ===", caerleon_liq_df)
         
-    # 5. WRITE DATA NON-DESTRUCTIVELY (Prevents Data Wiping)
     worksheet.update(values=final_data, range_name='A1', value_input_option='USER_ENTERED')
     
-    # Clears only the unused rows below your tables, leaving your data untouched
     new_row_count = len(final_data)
     worksheet.batch_clear([f'A{new_row_count + 1}:Z1000'])
     
-    # 6. BATCH FORMATTING (Avoids 429 Limit)
     requests_payload = [{"unmergeCells": {"range": {"sheetId": worksheet.id, "startRowIndex": 0, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 50}}}]
     
     col_idx = 1
