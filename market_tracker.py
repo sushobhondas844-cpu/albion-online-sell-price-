@@ -10,14 +10,13 @@ import re
 
 # ==========================================
 # MODULE 1: CONFIGURATION & STYLING
-# Defines the targeted cities and the color codes for the sheet
 # ==========================================
 CITIES = ["Martlock", "Caerleon", "Lymhurst", "Bridgewatch", "Thetford", "Fort Sterling"]
 SHEET_NAME = "Albion Market Tracker"
 
 CITY_COLORS = {
     "Martlock": color(0.6, 0.8, 1.0),
-    "Caerleon": color(1.0, 0.4, 0.4),
+    "Caerleon": color(1.0, 0.4, 0.4), # Red color for the Red Zone city
     "Lymhurst": color(0.6, 1.0, 0.6),
     "Bridgewatch": color(1.0, 0.8, 0.4),
     "Thetford": color(0.8, 0.6, 1.0),
@@ -34,10 +33,8 @@ RESOURCE_COLORS = {
 
 # ==========================================
 # MODULE 2: HELPER UTILITIES
-# Functions to translate column numbers, map item names, and assign colors
 # ==========================================
 def col_to_letter(col):
-    """Converts a column number to an Excel letter (1 -> A, 2 -> B)"""
     result = ""
     while col > 0:
         col, remainder = divmod(col - 1, 26)
@@ -45,7 +42,6 @@ def col_to_letter(col):
     return result
 
 def get_item_mapping():
-    """Fetches the official Albion item dictionary to map English names to internal IDs"""
     url = "https://raw.githubusercontent.com/broderickhyman/ao-bin-dumps/master/formatted/items.json"
     mapping = {}
     try:
@@ -61,7 +57,6 @@ def get_item_mapping():
     return mapping
 
 def parse_item_name(name, mapping):
-    """Parses user input (e.g., 'tier 4 hide') into the game's internal ID (e.g., 'T4_HIDE')"""
     name_lower = name.lower().strip()
     if name_lower in mapping:
         return mapping[name_lower]
@@ -80,7 +75,6 @@ def parse_item_name(name, mapping):
     return name.upper()
 
 def get_row_color(item_name):
-    """Determines the background color for an item row based on its resource type"""
     name_lower = item_name.lower()
     for key, c in RESOURCE_COLORS.items():
         if key in name_lower:
@@ -89,7 +83,6 @@ def get_row_color(item_name):
 
 # ==========================================
 # MODULE 3: API COMMUNICATION
-# Fetches the accurate 24-hour average price and daily volume from the Albion API
 # ==========================================
 def fetch_history_data(item_ids, server):
     url = f"https://{server}.albion-online-data.com/api/v2/stats/history/{','.join(item_ids)}?locations={','.join(CITIES)}&time-scale=24"
@@ -98,7 +91,6 @@ def fetch_history_data(item_ids, server):
 
 # ==========================================
 # MODULE 4: GOOGLE SHEETS PROCESSING
-# Handles reading user input, processing API data, and writing/formatting the sheet
 # ==========================================
 def update_server_tab(client, spreadsheet, server_name, server_code, global_mapping):
     try:
@@ -111,7 +103,8 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     items_to_track = []
     for i in raw_items:
         val = i.strip()
-        if "BEST ROUTES" in val or "---" in val:
+        # STOP scanning if it hits ANY summary section indicator
+        if "---" in val:
             break
         if val and val not in items_to_track:
             items_to_track.append(val)
@@ -130,7 +123,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     if not target_ids:
         return
         
-    # Fetch exact accurate history data
     history_data = fetch_history_data(target_ids, server=server_code)
     
     market_data = {} 
@@ -145,14 +137,19 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                 'volume': latest.get("item_count", 0)
             }
         
-    best_routes = []
+    safe_routes = []
+    caerleon_routes = []
+    
     for item in items_to_track:
         uid = parse_item_name(item, global_mapping)
         valid_cities = [c for c in CITIES if market_data.get((uid, c), {}).get("price", 0) > 0 and market_data.get((uid, c), {}).get("volume", 0) > 0]
         
-        if len(valid_cities) >= 2:
-            buy_city = min(valid_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
-            sell_city = max(valid_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
+        safe_cities = [c for c in valid_cities if c != "Caerleon"]
+        
+        # --- 1. CALCULATE BEST SAFE CITIES ROUTE ---
+        if len(safe_cities) >= 2:
+            buy_city = min(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
+            sell_city = max(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
             
             buy_price = market_data.get((uid, buy_city), {}).get("price", 0)
             sell_price = market_data.get((uid, sell_city), {}).get("price", 0)
@@ -161,12 +158,35 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             vol = market_data.get((uid, sell_city), {}).get("volume", 0)
             
             if profit > 0:
-                best_routes.append([item, buy_city, buy_price, sell_city, sell_price, profit, vol])
+                safe_routes.append([item, buy_city, buy_price, sell_city, sell_price, profit, vol])
                 
-    best_df = pd.DataFrame(best_routes, columns=["Item", "Buy At", "Avg Buy Price", "Sell At", "Avg Sell Price", "Net Profit (After Tax)", "Daily Vol"])
-    best_df = best_df.sort_values(by="Net Profit (After Tax)", ascending=False)
+        # --- 2. CALCULATE BEST CAERLEON (RED ZONE) ROUTE ---
+        if "Caerleon" in valid_cities and len(safe_cities) >= 1:
+            c_price = market_data.get((uid, "Caerleon"), {}).get("price", 0)
+            c_vol = market_data.get((uid, "Caerleon"), {}).get("volume", 0)
+            
+            # Scenario A: Buy in Safe City, Transport to Caerleon
+            best_safe_buy = min(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
+            safe_buy_price = market_data.get((uid, best_safe_buy), {}).get("price", 0)
+            profit_to_caerleon = int((c_price * 0.895) - safe_buy_price)
+            
+            # Scenario B: Buy in Caerleon, Transport to Safe City
+            best_safe_sell = max(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
+            safe_sell_price = market_data.get((uid, best_safe_sell), {}).get("price", 0)
+            safe_sell_vol = market_data.get((uid, best_safe_sell), {}).get("volume", 0)
+            profit_from_caerleon = int((safe_sell_price * 0.895) - c_price)
+            
+            # Pick whichever direction yields more profit
+            if profit_to_caerleon > 0 and profit_to_caerleon >= profit_from_caerleon:
+                caerleon_routes.append([item, best_safe_buy, safe_buy_price, "Caerleon", c_price, profit_to_caerleon, c_vol])
+            elif profit_from_caerleon > 0:
+                caerleon_routes.append([item, "Caerleon", c_price, best_safe_sell, safe_sell_price, profit_from_caerleon, safe_sell_vol])
+
+    route_columns = ["Item", "Buy At", "Avg Buy Price", "Sell At", "Avg Sell Price", "Net Profit (After Tax)", "Daily Vol"]
+    safe_df = pd.DataFrame(safe_routes, columns=route_columns).sort_values(by="Net Profit (After Tax)", ascending=False)
+    caerleon_df = pd.DataFrame(caerleon_routes, columns=route_columns).sort_values(by="Net Profit (After Tax)", ascending=False)
     
-    # Structure Headers (2 Columns per City: Avg Price & Volume)
+    # --- BUILD THE GRID ---
     header_row_1 = ["Item Name"]
     header_row_2 = [""]
     
@@ -185,20 +205,29 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             row.extend([price, vol])
         final_data.append(row)
         
+    # Append SAFE ROUTES table
     final_data.append([])
-    final_data.append(["--- BEST ROUTES SUMMARY ---"])
-    final_data.append(list(best_df.columns))
-    best_df_clean = best_df.astype(object).where(pd.notnull(best_df), None)
-    final_data.extend(best_df_clean.values.tolist())
+    final_data.append(["--- SAFE CITIES BEST ROUTES ---"])
+    final_data.append(list(safe_df.columns))
+    safe_df_clean = safe_df.astype(object).where(pd.notnull(safe_df), None)
+    final_data.extend(safe_df_clean.values.tolist())
+
+    # Append CAERLEON ROUTES table
+    final_data.append([])
+    final_data.append(["--- CAERLEON (RED ZONE) ROUTES ---"])
+    final_data.append(list(caerleon_df.columns))
+    caerleon_df_clean = caerleon_df.astype(object).where(pd.notnull(caerleon_df), None)
+    final_data.extend(caerleon_df_clean.values.tolist())
         
+    # Write to Sheet
     worksheet.clear()
     worksheet.clear_basic_filter()
     worksheet.update(values=final_data, range_name='A1')
     
-    # Apply precise styling and merging logic to protect city names
+    # --- APPLY STYLING ---
     requests_payload = []
     
-    # Completely unmerge all headers to prevent disappearing city names
+    # 0. Unmerge all existing headers entirely to protect city names
     requests_payload.append({
         "unmergeCells": {
             "range": {
@@ -209,7 +238,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         }
     })
     
-    # Merge exactly 2 columns per city
+    # 1. Remerge exactly 2 columns per city
     col_idx = 1
     for city in CITIES:
         requests_payload.append({
@@ -233,6 +262,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         horizontalAlignment='CENTER'
     ))
     
+    # Apply Header Faction Colors (Caerleon is naturally red)
     col_idx = 2
     for city in CITIES:
         bg_color = CITY_COLORS.get(city, color(1.0, 1.0, 1.0))
@@ -241,6 +271,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         format_cell_range(worksheet, f'{letter1}1:{letter2}{len(items_to_track)+2}', cellFormat(backgroundColor=bg_color))
         col_idx += 2
         
+    # Apply Item Row Colors
     current_row = 3
     for item in items_to_track:
         row_color = get_row_color(item)
@@ -249,7 +280,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
 
 # ==========================================
 # MODULE 5: MAIN EXECUTION
-# Initializes Google credentials and runs the update for both servers
 # ==========================================
 def main():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
