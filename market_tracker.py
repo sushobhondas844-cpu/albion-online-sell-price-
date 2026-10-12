@@ -138,7 +138,10 @@ def update_server_tab(client, spreadsheet, server_name, server_code):
     for item in price_df.index:
         row = [item]
         for city in cities_in_data:
-            row.extend([price_df.at[item, city], vol_df.at[item, city]])
+            # Convert NumPy types to standard Python int/float
+            price = int(price_df.at[item, city])
+            vol = int(vol_df.at[item, city])
+            row.extend([price, vol])
         final_data.append(row)
         
     # Append the Summary Section at the bottom
@@ -146,10 +149,14 @@ def update_server_tab(client, spreadsheet, server_name, server_code):
     final_data.append([])
     final_data.append(["--- BEST ROUTES SUMMARY ---"])
     final_data.append(list(best_df.columns))
-    final_data.extend(best_df.values.tolist())
+    
+    # Convert the pandas best_df to standard Python types before appending
+    # .astype(object) prevents int64 conversion issues
+    best_df_clean = best_df.astype(object).where(pd.notnull(best_df), None)
+    final_data.extend(best_df_clean.values.tolist())
         
-    # Write to Google Sheets
-    worksheet.update('A1', final_data)
+    # Write to Google Sheets (Updated syntax to fix the deprecation warning)
+    worksheet.update(values=final_data, range_name='A1')
     
     # --- APPLY STYLING ---
     # Bold the top header
