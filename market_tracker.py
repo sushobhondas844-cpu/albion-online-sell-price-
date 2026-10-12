@@ -8,7 +8,6 @@ import pandas as pd
 from datetime import datetime
 import re
 
-# --- CONFIGURATION ---
 CITIES = ["Martlock", "Caerleon", "Lymhurst", "Bridgewatch", "Thetford", "Fort Sterling"]
 SHEET_NAME = "Albion Market Tracker"
 
@@ -30,7 +29,6 @@ RESOURCE_COLORS = {
 }
 
 def col_to_letter(col):
-    """Converts a column number to an Excel letter (1 -> A, 2 -> B)"""
     result = ""
     while col > 0:
         col, remainder = divmod(col - 1, 26)
@@ -77,12 +75,7 @@ def get_row_color(item_name):
             return c
     return color(1.0, 1.0, 1.0)
 
-def fetch_live_prices(item_ids, server):
-    url = f"https://{server}.albion-online-data.com/api/v2/stats/prices/{','.join(item_ids)}?locations={','.join(CITIES)}"
-    res = requests.get(url)
-    return res.json() if res.status_code == 200 else []
-
-def fetch_history_volume(item_ids, server):
+def fetch_history_data(item_ids, server):
     url = f"https://{server}.albion-online-data.com/api/v2/stats/history/{','.join(item_ids)}?locations={','.join(CITIES)}&time-scale=24"
     res = requests.get(url)
     return res.json() if res.status_code == 200 else []
@@ -92,7 +85,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         worksheet = spreadsheet.worksheet(server_name)
         raw_items = worksheet.col_values(1)[2:]
     except gspread.exceptions.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=server_name, rows="100", cols="25")
+        worksheet = spreadsheet.add_worksheet(title=server_name, rows="100", cols="20")
         raw_items = []
         
     items_to_track = []
@@ -117,51 +110,47 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     if not target_ids:
         return
         
-    price_data = fetch_live_prices(target_ids, server=server_code)
-    history_data = fetch_history_volume(target_ids, server=server_code)
+    history_data = fetch_history_data(target_ids, server=server_code)
     
-    live_market = {} 
-    for p in price_data:
-        uid = p.get("item_id")
-        city = p.get("city")
-        if (uid, city) not in live_market:
-            live_market[(uid, city)] = {'buy': p.get("buy_price_max", 0), 'sell': p.get("sell_price_min", 0)}
-            
-    volume_market = {} 
+    market_data = {} 
     for h in history_data:
         uid = h.get("item_id")
         city = h.get("location")
         data = h.get("data", [])
-        vol = data[-1].get("item_count", 0) if data else 0
-        volume_market[(uid, city)] = vol
+        if data:
+            latest = data[-1]
+            market_data[(uid, city)] = {
+                'price': latest.get("avg_price", 0),
+                'volume': latest.get("item_count", 0)
+            }
         
     best_routes = []
     for item in items_to_track:
         uid = parse_item_name(item, global_mapping)
-        valid_cities = [c for c in CITIES if live_market.get((uid, c), {}).get("sell", 0) > 0 and volume_market.get((uid, c), 0) > 0]
+        valid_cities = [c for c in CITIES if market_data.get((uid, c), {}).get("price", 0) > 0 and market_data.get((uid, c), {}).get("volume", 0) > 0]
         
         if len(valid_cities) >= 2:
-            buy_city = min(valid_cities, key=lambda c: live_market.get((uid, c), {}).get("sell", 0))
-            sell_city = max(valid_cities, key=lambda c: live_market.get((uid, c), {}).get("sell", 0))
+            buy_city = min(valid_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
+            sell_city = max(valid_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
             
-            buy_price = live_market.get((uid, buy_city), {}).get("sell", 0)
-            sell_price = live_market.get((uid, sell_city), {}).get("sell", 0)
+            buy_price = market_data.get((uid, buy_city), {}).get("price", 0)
+            sell_price = market_data.get((uid, sell_city), {}).get("price", 0)
             
             profit = int((sell_price * 0.895) - buy_price)
-            vol = volume_market.get((uid, sell_city), 0)
+            vol = market_data.get((uid, sell_city), {}).get("volume", 0)
             
             if profit > 0:
                 best_routes.append([item, buy_city, buy_price, sell_city, sell_price, profit, vol])
                 
-    best_df = pd.DataFrame(best_routes, columns=["Item", "Buy At", "Live Buy Cost", "Sell At", "Live Sell Value", "Net Profit (After Tax)", "Daily Vol"])
+    best_df = pd.DataFrame(best_routes, columns=["Item", "Buy At", "Avg Buy Price", "Sell At", "Avg Sell Price", "Net Profit (After Tax)", "Daily Vol"])
     best_df = best_df.sort_values(by="Net Profit (After Tax)", ascending=False)
     
     header_row_1 = ["Item Name"]
     header_row_2 = [""]
     
     for city in CITIES:
-        header_row_1.extend([city, "", ""])
-        header_row_2.extend(["Highest Buy Order", "Lowest Sell Order", "Volume"])
+        header_row_1.extend([city, ""])
+        header_row_2.extend(["Avg Price", "Volume"])
         
     final_data = [header_row_1, header_row_2]
     
@@ -169,10 +158,9 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         uid = parse_item_name(item, global_mapping)
         row = [item]
         for city in CITIES:
-            buy_order = live_market.get((uid, city), {}).get("buy", 0)
-            sell_order = live_market.get((uid, city), {}).get("sell", 0)
-            vol = volume_market.get((uid, city), 0)
-            row.extend([buy_order, sell_order, vol])
+            price = market_data.get((uid, city), {}).get("price", 0)
+            vol = market_data.get((uid, city), {}).get("volume", 0)
+            row.extend([price, vol])
         final_data.append(row)
         
     final_data.append([])
@@ -185,10 +173,9 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     worksheet.clear_basic_filter()
     worksheet.update(values=final_data, range_name='A1')
     
-    # --- APPLY STYLING ---
     requests_payload = []
     
-    # 0. FIX: Unmerge all existing cells in the header area first to clear the old 2-column layout
+    # Clean old merged cells
     requests_payload.append({
         "unmergeCells": {
             "range": {
@@ -199,7 +186,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         }
     })
     
-    # 1. Merge City Header Cells (Spanning 3 columns)
+    # Merge exactly 2 columns per city
     col_idx = 1
     for city in CITIES:
         requests_payload.append({
@@ -207,17 +194,17 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                 "range": {
                     "sheetId": worksheet.id,
                     "startRowIndex": 0, "endRowIndex": 1,
-                    "startColumnIndex": col_idx, "endColumnIndex": col_idx + 3
+                    "startColumnIndex": col_idx, "endColumnIndex": col_idx + 2
                 },
                 "mergeType": "MERGE_ALL"
             }
         })
-        col_idx += 3
+        col_idx += 2
         
     if requests_payload:
         spreadsheet.batch_update({"requests": requests_payload})
         
-    end_col = col_to_letter(1 + (len(CITIES) * 3))
+    end_col = col_to_letter(1 + (len(CITIES) * 2))
     format_cell_range(worksheet, f'A1:{end_col}2', cellFormat(
         textFormat=textFormat(bold=True),
         horizontalAlignment='CENTER'
@@ -227,9 +214,9 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     for city in CITIES:
         bg_color = CITY_COLORS.get(city, color(1.0, 1.0, 1.0))
         letter1 = col_to_letter(col_idx)
-        letter2 = col_to_letter(col_idx + 2)
+        letter2 = col_to_letter(col_idx + 1)
         format_cell_range(worksheet, f'{letter1}1:{letter2}{len(items_to_track)+2}', cellFormat(backgroundColor=bg_color))
-        col_idx += 3
+        col_idx += 2
         
     current_row = 3
     for item in items_to_track:
@@ -251,13 +238,8 @@ def main():
         
     global_mapping = get_item_mapping()
         
-    print("Updating Americas Tab...")
     update_server_tab(client, spreadsheet, "Americas", "west", global_mapping)
-    
-    print("Updating Asia Tab...")
     update_server_tab(client, spreadsheet, "Asia", "east", global_mapping)
-    
-    print("Update Complete!")
 
 if __name__ == "__main__":
     main()
