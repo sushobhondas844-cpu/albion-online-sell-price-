@@ -132,8 +132,9 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         for idx, val in enumerate(headers2):
             if headers1[idx]: curr_city = headers1[idx]
             if curr_city and curr_city in city_cols:
-                if val == "Custom Buy": city_cols[curr_city]['buy'] = idx
-                if val == "Custom Sell": city_cols[curr_city]['sell'] = idx
+                # Updated to look for explicit Order headers
+                if "Buy Order" in val: city_cols[curr_city]['buy'] = idx
+                if "Sell Order" in val: city_cols[curr_city]['sell'] = idx
 
         for row in existing_data[2:]:
             item_name = row[0].strip()
@@ -217,7 +218,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             elif profit_from_c > 0:
                 api_caerleon_routes.append([item, "Caerleon", c_price, best_safe_sell, safe_sell_price, profit_from_c, safe_sell_vol, "API Avg"])
 
-        # --- HYBRID CUSTOM ROUTES (Enforced Priority) ---
+        # --- HYBRID CUSTOM ROUTES ---
         has_custom = False
         for c in CITIES:
             if custom_inputs.get((item, c), {}).get('buy', 0) > 0 or custom_inputs.get((item, c), {}).get('sell', 0) > 0:
@@ -236,7 +237,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                     c_buy = custom_inputs.get((item, b_city), {}).get('buy', 0)
                     c_sell = custom_inputs.get((item, s_city), {}).get('sell', 0)
                     
-                    # STRICT FILTER: Ignores route entirely if neither side uses your custom numbers
                     if c_buy == 0 and c_sell == 0: continue
                     
                     avg_buy = market_data.get((uid, b_city), {}).get('price', 0)
@@ -263,24 +263,22 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                         best_custom_profit = profit
                         notes = []
                         if c_buy == 0: notes.append(f"Avg Buy ({b_city})")
-                        else: notes.append(f"Custom Buy ({b_city})")
+                        else: notes.append(f"Custom Buy Order ({b_city})")
                         if c_sell == 0: notes.append(f"Avg Sell ({s_city})")
-                        else: notes.append(f"Custom Sell ({s_city})")
+                        else: notes.append(f"Custom Sell Order ({s_city})")
                         
-                        note_str = "PRIORITY: Custom Pair" if is_true_pair else " + ".join(notes)
+                        note_str = "PRIORITY: Custom Orders" if is_true_pair else " + ".join(notes)
                         best_custom_route = [item, b_city, actual_buy, s_city, actual_sell, profit, s_vol, note_str]
                         
-            # Separate Custom routes based on whether they hit the Red Zone
             if best_custom_route:
                 if best_custom_route[1] == "Caerleon" or best_custom_route[3] == "Caerleon":
                     custom_caerleon_routes.append(best_custom_route)
                 else:
                     custom_safe_routes.append(best_custom_route)
 
-    # 4. BUILD THE GRID (Applying Top 5 rules and Mergers)
+    # 4. BUILD THE GRID
     route_columns = ["Item", "Buy At", "Buy Price", "Sell At", "Sell Price", "Net Profit (After Tax)", "Daily Vol", "Type / Notes"]
     
-    # Caerleon combines custom and API, prioritizing Custom, then drops duplicates of the same item to keep Top 5
     caerleon_all = custom_caerleon_routes + api_caerleon_routes
     caerleon_df = pd.DataFrame(caerleon_all, columns=route_columns)
     if not caerleon_df.empty:
@@ -291,15 +289,15 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     if len(custom_safe_routes) > 0:
         custom_df = pd.DataFrame(custom_safe_routes, columns=route_columns).sort_values(by="Net Profit (After Tax)", ascending=False)
     else:
-        # Fallback to safe API routes if absolutely 0 custom inputs exist
         custom_df = safe_df.copy()
     
     header_row_1 = ["Item Name"]
     header_row_2 = [""]
     
+    # Updated headers to explicitly read "Custom Buy Order" and "Custom Sell Order"
     for city in CITIES:
         header_row_1.extend([city, "", "", ""])
-        header_row_2.extend(["Avg Price", "Volume", "Custom Buy", "Custom Sell"])
+        header_row_2.extend(["Avg Price", "Volume", "Custom Buy Order", "Custom Sell Order"])
         
     final_data = [header_row_1, header_row_2]
     
