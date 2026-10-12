@@ -16,7 +16,7 @@ SHEET_NAME = "Albion Market Tracker"
 
 CITY_COLORS = {
     "Martlock": color(0.6, 0.8, 1.0),
-    "Caerleon": color(1.0, 0.4, 0.4), # Red color for the Red Zone city
+    "Caerleon": color(1.0, 0.4, 0.4),
     "Lymhurst": color(0.6, 1.0, 0.6),
     "Bridgewatch": color(1.0, 0.8, 0.4),
     "Thetford": color(0.8, 0.6, 1.0),
@@ -81,37 +81,67 @@ def get_row_color(item_name):
             return c
     return color(1.0, 1.0, 1.0)
 
-# ==========================================
-# MODULE 3: API COMMUNICATION
-# ==========================================
 def fetch_history_data(item_ids, server):
     url = f"https://{server}.albion-online-data.com/api/v2/stats/history/{','.join(item_ids)}?locations={','.join(CITIES)}&time-scale=24"
     res = requests.get(url)
     return res.json() if res.status_code == 200 else []
 
 # ==========================================
-# MODULE 4: GOOGLE SHEETS PROCESSING
+# MODULE 3: GOOGLE SHEETS PROCESSING
 # ==========================================
 def update_server_tab(client, spreadsheet, server_name, server_code, global_mapping):
     try:
         worksheet = spreadsheet.worksheet(server_name)
-        raw_items = worksheet.col_values(1)[2:]
+        existing_data = worksheet.get_all_values()
     except gspread.exceptions.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=server_name, rows="100", cols="20")
-        raw_items = []
-        
+        worksheet = spreadsheet.add_worksheet(title=server_name, rows="100", cols="30")
+        existing_data = []
+
+    # 1. PARSE EXISTING ITEMS AND CUSTOM USER INPUTS
     items_to_track = []
-    for i in raw_items:
-        val = i.strip()
-        # STOP scanning if it hits ANY summary section indicator
-        if "---" in val:
-            break
-        if val and val not in items_to_track:
-            items_to_track.append(val)
-            
+    custom_inputs = {} # (item_name, city) -> {'buy': val, 'sell': val}
+    
+    if len(existing_data) >= 3:
+        headers1 = existing_data[0]
+        headers2 = existing_data[1]
+        
+        # Map out which columns belong to which city's custom inputs
+        city_cols = {}
+        curr_city = None
+        for idx, val in enumerate(headers1):
+            if val and val not in ["Item Name", ""] and "---" not in val:
+                curr_city = val
+                city_cols[curr_city] = {'buy': None, 'sell': None}
+                
+        curr_city = None
+        for idx, val in enumerate(headers2):
+            if headers1[idx]: curr_city = headers1[idx]
+            if curr_city and curr_city in city_cols:
+                if val == "Custom Buy": city_cols[curr_city]['buy'] = idx
+                if val == "Custom Sell": city_cols[curr_city]['sell'] = idx
+
+        # Read the items and save the custom numbers
+        for row in existing_data[2:]:
+            item_name = row[0].strip()
+            if not item_name or "---" in item_name: break
+            if item_name not in items_to_track:
+                items_to_track.append(item_name)
+                
+            for city, cols in city_cols.items():
+                b_idx = cols['buy']
+                s_idx = cols['sell']
+                b_val = row[b_idx].strip() if b_idx is not None and b_idx < len(row) else ""
+                s_val = row[s_idx].strip() if s_idx is not None and s_idx < len(row) else ""
+                
+                b_num = int(re.sub(r'[^\d]', '', b_val)) if re.sub(r'[^\d]', '', b_val) else 0
+                s_num = int(re.sub(r'[^\d]', '', s_val)) if re.sub(r'[^\d]', '', s_val) else 0
+                
+                custom_inputs[(item_name, city)] = {'buy': b_num, 'sell': s_num}
+                
     if not items_to_track:
         items_to_track = ["tier 2 hide", "tier 3 leather", "tier 4 cloth", "tier 5 metal bar"]
-        
+
+    # 2. FETCH API DATA
     target_ids = []
     original_names = {}
     for item in items_to_track:
@@ -124,7 +154,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         return
         
     history_data = fetch_history_data(target_ids, server=server_code)
-    
     market_data = {} 
     for h in history_data:
         uid = h.get("item_id")
@@ -132,155 +161,174 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         data = h.get("data", [])
         if data:
             latest = data[-1]
-            market_data[(uid, city)] = {
-                'price': latest.get("avg_price", 0),
-                'volume': latest.get("item_count", 0)
-            }
-        
+            market_data[(uid, city)] = {'price': latest.get("avg_price", 0), 'volume': latest.get("item_count", 0)}
+
+    # 3. CALCULATE ROUTES
     safe_routes = []
     caerleon_routes = []
+    custom_routes = []
     
     for item in items_to_track:
         uid = parse_item_name(item, global_mapping)
         valid_cities = [c for c in CITIES if market_data.get((uid, c), {}).get("price", 0) > 0 and market_data.get((uid, c), {}).get("volume", 0) > 0]
-        
         safe_cities = [c for c in valid_cities if c != "Caerleon"]
         
-        # --- 1. CALCULATE BEST SAFE CITIES ROUTE ---
+        # --- API SAFE ROUTES ---
         if len(safe_cities) >= 2:
             buy_city = min(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
             sell_city = max(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
             
             buy_price = market_data.get((uid, buy_city), {}).get("price", 0)
             sell_price = market_data.get((uid, sell_city), {}).get("price", 0)
-            
             profit = int((sell_price * 0.895) - buy_price)
             vol = market_data.get((uid, sell_city), {}).get("volume", 0)
             
             if profit > 0:
                 safe_routes.append([item, buy_city, buy_price, sell_city, sell_price, profit, vol])
                 
-        # --- 2. CALCULATE BEST CAERLEON (RED ZONE) ROUTE ---
+        # --- API CAERLEON ROUTES ---
         if "Caerleon" in valid_cities and len(safe_cities) >= 1:
             c_price = market_data.get((uid, "Caerleon"), {}).get("price", 0)
             c_vol = market_data.get((uid, "Caerleon"), {}).get("volume", 0)
             
-            # Scenario A: Buy in Safe City, Transport to Caerleon
             best_safe_buy = min(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
             safe_buy_price = market_data.get((uid, best_safe_buy), {}).get("price", 0)
-            profit_to_caerleon = int((c_price * 0.895) - safe_buy_price)
+            profit_to_c = int((c_price * 0.895) - safe_buy_price)
             
-            # Scenario B: Buy in Caerleon, Transport to Safe City
             best_safe_sell = max(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
             safe_sell_price = market_data.get((uid, best_safe_sell), {}).get("price", 0)
             safe_sell_vol = market_data.get((uid, best_safe_sell), {}).get("volume", 0)
-            profit_from_caerleon = int((safe_sell_price * 0.895) - c_price)
+            profit_from_c = int((safe_sell_price * 0.895) - c_price)
             
-            # Pick whichever direction yields more profit
-            if profit_to_caerleon > 0 and profit_to_caerleon >= profit_from_caerleon:
-                caerleon_routes.append([item, best_safe_buy, safe_buy_price, "Caerleon", c_price, profit_to_caerleon, c_vol])
-            elif profit_from_caerleon > 0:
-                caerleon_routes.append([item, "Caerleon", c_price, best_safe_sell, safe_sell_price, profit_from_caerleon, safe_sell_vol])
+            if profit_to_c > 0 and profit_to_c >= profit_from_c:
+                caerleon_routes.append([item, best_safe_buy, safe_buy_price, "Caerleon", c_price, profit_to_c, c_vol])
+            elif profit_from_c > 0:
+                caerleon_routes.append([item, "Caerleon", c_price, best_safe_sell, safe_sell_price, profit_from_c, safe_sell_vol])
 
-    route_columns = ["Item", "Buy At", "Avg Buy Price", "Sell At", "Avg Sell Price", "Net Profit (After Tax)", "Daily Vol"]
+        # --- HYBRID CUSTOM ROUTES ---
+        best_custom_profit = 0
+        best_custom_route = None
+        
+        for b_city in CITIES:
+            for s_city in CITIES:
+                if b_city == s_city: continue
+                
+                # Fetch custom inputs; fallback to avg price
+                c_buy = custom_inputs.get((item, b_city), {}).get('buy', 0)
+                c_sell = custom_inputs.get((item, s_city), {}).get('sell', 0)
+                
+                avg_buy = market_data.get((uid, b_city), {}).get('price', 0)
+                avg_sell = market_data.get((uid, s_city), {}).get('price', 0)
+                s_vol = market_data.get((uid, s_city), {}).get('volume', 0)
+                
+                actual_buy = c_buy if c_buy > 0 else avg_buy
+                actual_sell = c_sell if c_sell > 0 else avg_sell
+                
+                if actual_buy == 0 or actual_sell == 0 or s_vol == 0: continue
+                
+                profit = int((actual_sell * 0.895) - actual_buy)
+                
+                if profit > best_custom_profit:
+                    best_custom_profit = profit
+                    notes = []
+                    if c_buy == 0: notes.append(f"Avg Price used for {b_city}(Buy)")
+                    if c_sell == 0: notes.append(f"Avg Price used for {s_city}(Sell)")
+                    note_str = ", ".join(notes) if notes else "Custom Prices Used"
+                    
+                    best_custom_route = [item, b_city, actual_buy, s_city, actual_sell, profit, s_vol, note_str]
+                    
+        if best_custom_route:
+            custom_routes.append(best_custom_route)
+
+    # 4. BUILD THE GRID
+    route_columns = ["Item", "Buy At", "Buy Price", "Sell At", "Sell Price", "Net Profit (After Tax)", "Daily Vol"]
     safe_df = pd.DataFrame(safe_routes, columns=route_columns).sort_values(by="Net Profit (After Tax)", ascending=False)
     caerleon_df = pd.DataFrame(caerleon_routes, columns=route_columns).sort_values(by="Net Profit (After Tax)", ascending=False)
     
-    # --- BUILD THE GRID ---
+    custom_cols = route_columns + ["Notes (Fallback Status)"]
+    custom_df = pd.DataFrame(custom_routes, columns=custom_cols).sort_values(by="Net Profit (After Tax)", ascending=False)
+    
     header_row_1 = ["Item Name"]
     header_row_2 = [""]
     
     for city in CITIES:
-        header_row_1.extend([city, ""])
-        header_row_2.extend(["Avg Price", "Volume"])
+        header_row_1.extend([city, "", "", ""])
+        header_row_2.extend(["Avg Price", "Volume", "Custom Buy", "Custom Sell"])
         
     final_data = [header_row_1, header_row_2]
     
+    # Fill in Data and Preserve User Custom Values
     for item in items_to_track: 
         uid = parse_item_name(item, global_mapping)
         row = [item]
         for city in CITIES:
             price = market_data.get((uid, city), {}).get("price", 0)
             vol = market_data.get((uid, city), {}).get("volume", 0)
-            row.extend([price, vol])
+            c_buy = custom_inputs.get((item, city), {}).get('buy', 0)
+            c_sell = custom_inputs.get((item, city), {}).get('sell', 0)
+            
+            # Format custom cells nicely, leave blank if 0 so user can type
+            c_buy_str = c_buy if c_buy > 0 else ""
+            c_sell_str = c_sell if c_sell > 0 else ""
+            
+            row.extend([price, vol, c_buy_str, c_sell_str])
         final_data.append(row)
         
-    # Append SAFE ROUTES table
-    final_data.append([])
-    final_data.append(["--- SAFE CITIES BEST ROUTES ---"])
-    final_data.append(list(safe_df.columns))
-    safe_df_clean = safe_df.astype(object).where(pd.notnull(safe_df), None)
-    final_data.extend(safe_df_clean.values.tolist())
+    # Append Tables
+    def append_table(title, df):
+        final_data.append([])
+        final_data.append([title])
+        final_data.append(list(df.columns))
+        clean_df = df.astype(object).where(pd.notnull(df), None)
+        final_data.extend(clean_df.values.tolist())
 
-    # Append CAERLEON ROUTES table
-    final_data.append([])
-    final_data.append(["--- CAERLEON (RED ZONE) ROUTES ---"])
-    final_data.append(list(caerleon_df.columns))
-    caerleon_df_clean = caerleon_df.astype(object).where(pd.notnull(caerleon_df), None)
-    final_data.extend(caerleon_df_clean.values.tolist())
+    append_table("--- CUSTOM USER ROUTES (Hybrid) ---", custom_df)
+    append_table("--- SAFE CITIES API ROUTES ---", safe_df)
+    append_table("--- CAERLEON (RED ZONE) API ROUTES ---", caerleon_df)
         
-    # Write to Sheet
     worksheet.clear()
     worksheet.clear_basic_filter()
     worksheet.update(values=final_data, range_name='A1')
     
-    # --- APPLY STYLING ---
-    requests_payload = []
+    # 5. APPLY STYLING
+    requests_payload = [{"unmergeCells": {"range": {"sheetId": worksheet.id, "startRowIndex": 0, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 50}}}]
     
-    # 0. Unmerge all existing headers entirely to protect city names
-    requests_payload.append({
-        "unmergeCells": {
-            "range": {
-                "sheetId": worksheet.id,
-                "startRowIndex": 0, "endRowIndex": 2,
-                "startColumnIndex": 0, "endColumnIndex": 50
-            }
-        }
-    })
-    
-    # 1. Remerge exactly 2 columns per city
     col_idx = 1
     for city in CITIES:
         requests_payload.append({
             "mergeCells": {
-                "range": {
-                    "sheetId": worksheet.id,
-                    "startRowIndex": 0, "endRowIndex": 1,
-                    "startColumnIndex": col_idx, "endColumnIndex": col_idx + 2
-                },
+                "range": {"sheetId": worksheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": col_idx, "endColumnIndex": col_idx + 4},
                 "mergeType": "MERGE_ALL"
             }
         })
-        col_idx += 2
+        col_idx += 4
         
     if requests_payload:
         spreadsheet.batch_update({"requests": requests_payload})
         
-    end_col = col_to_letter(1 + (len(CITIES) * 2))
-    format_cell_range(worksheet, f'A1:{end_col}2', cellFormat(
-        textFormat=textFormat(bold=True),
-        horizontalAlignment='CENTER'
-    ))
+    end_col = col_to_letter(1 + (len(CITIES) * 4))
+    format_cell_range(worksheet, f'A1:{end_col}2', cellFormat(textFormat=textFormat(bold=True), horizontalAlignment='CENTER'))
     
-    # Apply Header Faction Colors (Caerleon is naturally red)
     col_idx = 2
     for city in CITIES:
         bg_color = CITY_COLORS.get(city, color(1.0, 1.0, 1.0))
         letter1 = col_to_letter(col_idx)
-        letter2 = col_to_letter(col_idx + 1)
+        letter2 = col_to_letter(col_idx + 3)
         format_cell_range(worksheet, f'{letter1}1:{letter2}{len(items_to_track)+2}', cellFormat(backgroundColor=bg_color))
-        col_idx += 2
         
-    # Apply Item Row Colors
+        # Color the custom input columns slightly off-white to show they are editable
+        cust1 = col_to_letter(col_idx + 2)
+        cust2 = col_to_letter(col_idx + 3)
+        format_cell_range(worksheet, f'{cust1}3:{cust2}{len(items_to_track)+2}', cellFormat(backgroundColor=color(0.97, 0.97, 0.97)))
+        
+        col_idx += 4
+        
     current_row = 3
     for item in items_to_track:
         row_color = get_row_color(item)
         format_cell_range(worksheet, f'A{current_row}:{end_col}{current_row}', cellFormat(backgroundColor=row_color))
         current_row += 1
 
-# ==========================================
-# MODULE 5: MAIN EXECUTION
-# ==========================================
 def main():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     creds_dict = json.loads(creds_json)
@@ -297,10 +345,8 @@ def main():
         
     print("Updating Americas Tab...")
     update_server_tab(client, spreadsheet, "Americas", "west", global_mapping)
-    
     print("Updating Asia Tab...")
     update_server_tab(client, spreadsheet, "Asia", "east", global_mapping)
-    
     print("Update Complete!")
 
 if __name__ == "__main__":
