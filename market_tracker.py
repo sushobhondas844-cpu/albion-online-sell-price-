@@ -356,11 +356,11 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         clean_df = df.astype(object).where(pd.notnull(df), None)
         final_data.extend(clean_df.values.tolist())
 
-    append_table("=== CUSTOM USER ROUTES (Hybrid) ===", custom_df)
-    append_table("=== SAFE CITIES API ROUTES (Top 5) ===", safe_df)
-    append_table("=== CAERLEON (RED ZONE) API ROUTES (Top 5) ===", caerleon_df)
-    append_table("=== BEST LIQUIDATION: SAFE CITIES ===", safe_liq_df)
-    append_table("=== BEST LIQUIDATION: CAERLEON ===", caerleon_liq_df)
+    append_table("--- CUSTOM USER ROUTES (Hybrid) ---", custom_df)
+    append_table("--- SAFE CITIES API ROUTES (Top 5) ---", safe_df)
+    append_table("--- CAERLEON (RED ZONE) API ROUTES (Top 5) ---", caerleon_df)
+    append_table("--- BEST LIQUIDATION: SAFE CITIES ---", safe_liq_df)
+    append_table("--- BEST LIQUIDATION: CAERLEON ---", caerleon_liq_df)
         
     worksheet.update(values=final_data, range_name='A1', value_input_option='USER_ENTERED')
     
