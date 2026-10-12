@@ -124,6 +124,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     items_to_track = generate_tracking_list()
     custom_inputs = {} 
     
+    # Non-Destructive Parsing (Ignores summary section headers using "---")
     if len(existing_data) >= 3:
         headers1 = existing_data[0]
         headers2 = existing_data[1]
@@ -131,7 +132,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         city_cols = {}
         curr_city = None
         for idx, val in enumerate(headers1):
-            if val and val not in ["Item Name", ""] and "---" not in val and "===" not in val:
+            if val and val not in ["Item Name", ""] and "---" not in val:
                 curr_city = val
                 city_cols[curr_city] = {'buy': None, 'sell': None}
                 
@@ -144,7 +145,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
 
         for row in existing_data[2:]:
             item_name = row[0].strip()
-            if not item_name or "---" in item_name or "===" in item_name: break
+            if not item_name or "---" in item_name: break
             if item_name not in items_to_track:
                 items_to_track.append(item_name)
                 
@@ -182,43 +183,69 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     api_caerleon_routes = []
     custom_safe_routes = []
     custom_caerleon_routes = []
-    safe_liquidations = []
-    caerleon_liquidations = []
+    
+    # 4 Liquidation Lists for completely separated tables
+    custom_safe_liq = []
+    custom_caerleon_liq = []
+    api_safe_liq = []
+    api_caerleon_liq = []
     
     for item in items_to_track:
         uid = parse_item_name(item, global_mapping)
         valid_cities = [c for c in CITIES if market_data.get((uid, c), {}).get("price", 0) > 0 and market_data.get((uid, c), {}).get("volume", 0) > 0]
         safe_cities = [c for c in valid_cities if c != "Caerleon"]
         
-        # Determine Best Safe City Liquidation
-        best_safe_sell_city = ""
-        best_safe_sell_price = 0
-        best_safe_c_buy = 0
-        best_safe_api_avg = 0
+        # =======================================
+        # LIQUIDATION LOGIC (Custom vs API Split)
+        # =======================================
+        
+        # 1. SAFE CITIES LIQUIDATION
+        best_safe_custom_price = 0
+        best_safe_custom_city = ""
+        best_safe_custom_api_fallback = 0
+        
+        best_safe_api_price = 0
+        best_safe_api_city = ""
+        
+        has_any_safe_custom = False
         
         for c in safe_cities:
             api_avg = market_data.get((uid, c), {}).get('price', 0)
             c_buy = custom_inputs.get((item, c), {}).get('buy_num', 0)
-            check_price = c_buy if c_buy > 0 else api_avg
             
-            if check_price > best_safe_sell_price:
-                best_safe_sell_price = check_price
-                best_safe_sell_city = c
-                best_safe_c_buy = c_buy
-                best_safe_api_avg = api_avg
+            # Check Custom Inputs
+            if c_buy > 0:
+                has_any_safe_custom = True
+                if c_buy > best_safe_custom_price:
+                    best_safe_custom_price = c_buy
+                    best_safe_custom_city = c
+                    best_safe_custom_api_fallback = api_avg
+                    
+            # Check API Fallbacks
+            if api_avg > best_safe_api_price:
+                best_safe_api_price = api_avg
+                best_safe_api_city = c
                 
-        if best_safe_sell_price > 0:
-            c_buy_display = best_safe_c_buy if best_safe_c_buy > 0 else ""
-            safe_liquidations.append([item, best_safe_sell_city, c_buy_display, best_safe_api_avg])
+        # Send to strictly separated tables
+        if has_any_safe_custom:
+            custom_safe_liq.append([item, best_safe_custom_city, best_safe_custom_price, best_safe_custom_api_fallback])
+        elif best_safe_api_price > 0:
+            api_safe_liq.append([item, best_safe_api_city, "", best_safe_api_price])
             
-        # Determine Best Caerleon Liquidation
+        # 2. CAERLEON LIQUIDATION
         if "Caerleon" in valid_cities:
-            api_avg = market_data.get((uid, "Caerleon"), {}).get('price', 0)
-            c_buy = custom_inputs.get((item, "Caerleon"), {}).get('buy_num', 0)
-            best_c_price = c_buy if c_buy > 0 else api_avg
-            c_buy_display = c_buy if c_buy > 0 else ""
-            caerleon_liquidations.append([item, "Caerleon", c_buy_display, api_avg])
+            c_buy_caerleon = custom_inputs.get((item, "Caerleon"), {}).get('buy_num', 0)
+            api_avg_caerleon = market_data.get((uid, "Caerleon"), {}).get('price', 0)
+            
+            if c_buy_caerleon > 0:
+                custom_caerleon_liq.append([item, "Caerleon", c_buy_caerleon, api_avg_caerleon])
+            elif api_avg_caerleon > 0:
+                api_caerleon_liq.append([item, "Caerleon", "", api_avg_caerleon])
 
+        # =======================================
+        # ROUTES LOGIC
+        # =======================================
+        
         # --- API SAFE ROUTES ---
         if len(safe_cities) >= 2:
             buy_city = min(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
@@ -314,9 +341,11 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                 else:
                     custom_safe_routes.append(best_custom_route)
 
+    # 4. BUILD THE GRID & DATAFRAMES
     route_columns = ["Item", "Buy At", "Buy Price", "Sell At", "Sell Price", "Net Profit", "Daily Vol", "Sell Viability", "Type / Notes"]
     liq_columns = ["Item", "Best City to Sell", "Custom Buy Order", "API Avg Price"]
     
+    # Route Dataframes
     caerleon_all = custom_caerleon_routes + api_caerleon_routes
     caerleon_df = pd.DataFrame(caerleon_all, columns=route_columns)
     if not caerleon_df.empty:
@@ -329,15 +358,12 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     else:
         custom_df = safe_df.copy()
         
-    # Sort liquidations by the effective price (custom if available, else API avg)
-    def liq_sort_key(row):
-        return row[2] if row[2] != "" else row[3]
-        
-    safe_liquidations.sort(key=liq_sort_key, reverse=True)
-    caerleon_liquidations.sort(key=liq_sort_key, reverse=True)
+    # Liquidation Dataframes (Unrestricted for Custom, Head(10) for API fallback)
+    safe_custom_liq_df = pd.DataFrame(custom_safe_liq, columns=liq_columns).sort_values(by="Custom Buy Order", ascending=False) if len(custom_safe_liq) > 0 else pd.DataFrame()
+    caerleon_custom_liq_df = pd.DataFrame(custom_caerleon_liq, columns=liq_columns).sort_values(by="Custom Buy Order", ascending=False) if len(custom_caerleon_liq) > 0 else pd.DataFrame()
     
-    safe_liq_df = pd.DataFrame(safe_liquidations[:10], columns=liq_columns)
-    caerleon_liq_df = pd.DataFrame(caerleon_liquidations[:10], columns=liq_columns)
+    safe_api_liq_df = pd.DataFrame(api_safe_liq, columns=liq_columns).sort_values(by="API Avg Price", ascending=False).head(10) if len(api_safe_liq) > 0 else pd.DataFrame()
+    caerleon_api_liq_df = pd.DataFrame(api_caerleon_liq, columns=liq_columns).sort_values(by="API Avg Price", ascending=False).head(10) if len(api_caerleon_liq) > 0 else pd.DataFrame()
     
     header_row_1 = ["Item Name"]
     header_row_2 = [""]
@@ -362,24 +388,28 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         final_data.append(row)
         
     def append_table(title, df):
-        if df.empty: return
+        if df is None or df.empty: return
         final_data.append([])
         final_data.append([title])
         final_data.append(list(df.columns))
         clean_df = df.astype(object).where(pd.notnull(df), None)
         final_data.extend(clean_df.values.tolist())
 
+    # Safely appending all tables using dashes to prevent Google Sheets #ERROR!
     append_table("--- CUSTOM USER ROUTES (Hybrid) ---", custom_df)
     append_table("--- SAFE CITIES API ROUTES (Top 5) ---", safe_df)
     append_table("--- CAERLEON (RED ZONE) API ROUTES (Top 5) ---", caerleon_df)
-    append_table("--- BEST LIQUIDATION: SAFE CITIES ---", safe_liq_df)
-    append_table("--- BEST LIQUIDATION: CAERLEON ---", caerleon_liq_df)
+    append_table("--- BEST LIQUIDATION (CUSTOM): SAFE CITIES ---", safe_custom_liq_df)
+    append_table("--- BEST LIQUIDATION (CUSTOM): CAERLEON ---", caerleon_custom_liq_df)
+    append_table("--- BEST LIQUIDATION (API): SAFE CITIES ---", safe_api_liq_df)
+    append_table("--- BEST LIQUIDATION (API): CAERLEON ---", caerleon_api_liq_df)
         
+    # 5. NON-DESTRUCTIVE WRITE
     worksheet.update(values=final_data, range_name='A1', value_input_option='USER_ENTERED')
-    
     new_row_count = len(final_data)
     worksheet.batch_clear([f'A{new_row_count + 1}:Z1000'])
     
+    # 6. BATCH FORMATTING (Avoids 429 API Limit)
     requests_payload = [{"unmergeCells": {"range": {"sheetId": worksheet.id, "startRowIndex": 0, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 50}}}]
     
     col_idx = 1
