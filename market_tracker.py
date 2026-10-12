@@ -176,10 +176,10 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             market_data[(uid, city)] = {'price': latest.get("avg_price", 0), 'volume': latest.get("item_count", 0)}
 
     # 3. CALCULATE ROUTES
-    safe_routes = []
-    caerleon_routes = []
-    custom_routes = []
-    custom_routes_pure_fallback = []
+    api_safe_routes = []
+    api_caerleon_routes = []
+    custom_safe_routes = []
+    custom_caerleon_routes = []
     
     for item in items_to_track:
         uid = parse_item_name(item, global_mapping)
@@ -190,14 +190,13 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         if len(safe_cities) >= 2:
             buy_city = min(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
             sell_city = max(safe_cities, key=lambda c: market_data.get((uid, c), {}).get("price", 0))
-            
             buy_price = market_data.get((uid, buy_city), {}).get("price", 0)
             sell_price = market_data.get((uid, sell_city), {}).get("price", 0)
             profit = int((sell_price * 0.895) - buy_price)
             vol = market_data.get((uid, sell_city), {}).get("volume", 0)
             
             if profit > 0:
-                safe_routes.append([item, buy_city, buy_price, sell_city, sell_price, profit, vol])
+                api_safe_routes.append([item, buy_city, buy_price, sell_city, sell_price, profit, vol, "API Avg"])
                 
         # --- API CAERLEON ROUTES ---
         if "Caerleon" in valid_cities and len(safe_cities) >= 1:
@@ -214,68 +213,86 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             profit_from_c = int((safe_sell_price * 0.895) - c_price)
             
             if profit_to_c > 0 and profit_to_c >= profit_from_c:
-                caerleon_routes.append([item, best_safe_buy, safe_buy_price, "Caerleon", c_price, profit_to_c, c_vol])
+                api_caerleon_routes.append([item, best_safe_buy, safe_buy_price, "Caerleon", c_price, profit_to_c, c_vol, "API Avg"])
             elif profit_from_c > 0:
-                caerleon_routes.append([item, "Caerleon", c_price, best_safe_sell, safe_sell_price, profit_from_c, safe_sell_vol])
+                api_caerleon_routes.append([item, "Caerleon", c_price, best_safe_sell, safe_sell_price, profit_from_c, safe_sell_vol, "API Avg"])
 
-        # --- HYBRID CUSTOM ROUTES ---
-        best_custom_profit = 0
-        best_custom_route = None
-        has_true_custom_pair = False
-        
-        for b_city in CITIES:
-            for s_city in CITIES:
-                if b_city == s_city: continue
+        # --- HYBRID CUSTOM ROUTES (Enforced Priority) ---
+        has_custom = False
+        for c in CITIES:
+            if custom_inputs.get((item, c), {}).get('buy', 0) > 0 or custom_inputs.get((item, c), {}).get('sell', 0) > 0:
+                has_custom = True
+                break
                 
-                c_buy = custom_inputs.get((item, b_city), {}).get('buy', 0)
-                c_sell = custom_inputs.get((item, s_city), {}).get('sell', 0)
-                
-                avg_buy = market_data.get((uid, b_city), {}).get('price', 0)
-                avg_sell = market_data.get((uid, s_city), {}).get('price', 0)
-                s_vol = market_data.get((uid, s_city), {}).get('volume', 0)
-                
-                is_true_pair = (c_buy > 0 and c_sell > 0)
-                actual_buy = c_buy if c_buy > 0 else avg_buy
-                actual_sell = c_sell if c_sell > 0 else avg_sell
-                
-                if actual_buy == 0 or actual_sell == 0 or s_vol == 0: continue
-                profit = int((actual_sell * 0.895) - actual_buy)
-                
-                should_update = False
-                if is_true_pair and not has_true_custom_pair:
-                    should_update = True 
-                    has_true_custom_pair = True
-                elif is_true_pair and has_true_custom_pair and profit > best_custom_profit:
-                    should_update = True 
-                elif not has_true_custom_pair and profit > best_custom_profit:
-                    should_update = True 
-                
-                if should_update:
-                    best_custom_profit = profit
-                    notes = []
-                    if c_buy == 0: notes.append(f"Avg Buy used for {b_city}")
-                    if c_sell == 0: notes.append(f"Avg Sell used for {s_city}")
+        if has_custom:
+            best_custom_profit = 0
+            best_custom_route = None
+            has_true_custom_pair = False
+            
+            for b_city in CITIES:
+                for s_city in CITIES:
+                    if b_city == s_city: continue
                     
-                    note_str = "PRIORITY: Custom Pair" if is_true_pair else ", ".join(notes)
-                    best_custom_route = [item, b_city, actual_buy, s_city, actual_sell, profit, s_vol, note_str]
+                    c_buy = custom_inputs.get((item, b_city), {}).get('buy', 0)
+                    c_sell = custom_inputs.get((item, s_city), {}).get('sell', 0)
                     
-        if best_custom_route:
-            if "PRIORITY" in best_custom_route[-1] or "Avg Buy" in best_custom_route[-1] or "Avg Sell" in best_custom_route[-1]:
-                if any(custom_inputs.get((item, c), {}).get(t, 0) > 0 for c in CITIES for t in ['buy', 'sell']):
-                    custom_routes.append(best_custom_route)
+                    # STRICT FILTER: Ignores route entirely if neither side uses your custom numbers
+                    if c_buy == 0 and c_sell == 0: continue
+                    
+                    avg_buy = market_data.get((uid, b_city), {}).get('price', 0)
+                    avg_sell = market_data.get((uid, s_city), {}).get('price', 0)
+                    s_vol = market_data.get((uid, s_city), {}).get('volume', 0)
+                    
+                    is_true_pair = (c_buy > 0 and c_sell > 0)
+                    actual_buy = c_buy if c_buy > 0 else avg_buy
+                    actual_sell = c_sell if c_sell > 0 else avg_sell
+                    
+                    if actual_buy == 0 or actual_sell == 0 or s_vol == 0: continue
+                    profit = int((actual_sell * 0.895) - actual_buy)
+                    
+                    should_update = False
+                    if is_true_pair and not has_true_custom_pair:
+                        should_update = True 
+                        has_true_custom_pair = True
+                    elif is_true_pair and has_true_custom_pair and profit > best_custom_profit:
+                        should_update = True 
+                    elif not has_true_custom_pair and profit > best_custom_profit:
+                        should_update = True 
+                    
+                    if should_update:
+                        best_custom_profit = profit
+                        notes = []
+                        if c_buy == 0: notes.append(f"Avg Buy ({b_city})")
+                        else: notes.append(f"Custom Buy ({b_city})")
+                        if c_sell == 0: notes.append(f"Avg Sell ({s_city})")
+                        else: notes.append(f"Custom Sell ({s_city})")
+                        
+                        note_str = "PRIORITY: Custom Pair" if is_true_pair else " + ".join(notes)
+                        best_custom_route = [item, b_city, actual_buy, s_city, actual_sell, profit, s_vol, note_str]
+                        
+            # Separate Custom routes based on whether they hit the Red Zone
+            if best_custom_route:
+                if best_custom_route[1] == "Caerleon" or best_custom_route[3] == "Caerleon":
+                    custom_caerleon_routes.append(best_custom_route)
                 else:
-                    custom_routes_pure_fallback.append(best_custom_route)
+                    custom_safe_routes.append(best_custom_route)
 
-    # 4. BUILD THE GRID
-    route_columns = ["Item", "Buy At", "Buy Price", "Sell At", "Sell Price", "Net Profit (After Tax)", "Daily Vol"]
-    safe_df = pd.DataFrame(safe_routes, columns=route_columns).sort_values(by="Net Profit (After Tax)", ascending=False).head(5)
-    caerleon_df = pd.DataFrame(caerleon_routes, columns=route_columns).sort_values(by="Net Profit (After Tax)", ascending=False).head(5)
+    # 4. BUILD THE GRID (Applying Top 5 rules and Mergers)
+    route_columns = ["Item", "Buy At", "Buy Price", "Sell At", "Sell Price", "Net Profit (After Tax)", "Daily Vol", "Type / Notes"]
     
-    custom_cols = route_columns + ["Notes (Fallback Status)"]
-    if len(custom_routes) > 0:
-        custom_df = pd.DataFrame(custom_routes, columns=custom_cols).sort_values(by="Net Profit (After Tax)", ascending=False)
+    # Caerleon combines custom and API, prioritizing Custom, then drops duplicates of the same item to keep Top 5
+    caerleon_all = custom_caerleon_routes + api_caerleon_routes
+    caerleon_df = pd.DataFrame(caerleon_all, columns=route_columns)
+    if not caerleon_df.empty:
+        caerleon_df = caerleon_df.drop_duplicates(subset=["Item"], keep="first").sort_values(by="Net Profit (After Tax)", ascending=False).head(5)
+        
+    safe_df = pd.DataFrame(api_safe_routes, columns=route_columns).sort_values(by="Net Profit (After Tax)", ascending=False).head(5)
+    
+    if len(custom_safe_routes) > 0:
+        custom_df = pd.DataFrame(custom_safe_routes, columns=route_columns).sort_values(by="Net Profit (After Tax)", ascending=False)
     else:
-        custom_df = pd.DataFrame(custom_routes_pure_fallback, columns=custom_cols).sort_values(by="Net Profit (After Tax)", ascending=False).head(5)
+        # Fallback to safe API routes if absolutely 0 custom inputs exist
+        custom_df = safe_df.copy()
     
     header_row_1 = ["Item Name"]
     header_row_2 = [""]
@@ -302,6 +319,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         final_data.append(row)
         
     def append_table(title, df):
+        if df.empty: return
         final_data.append([])
         final_data.append([title])
         final_data.append(list(df.columns))
@@ -316,9 +334,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     worksheet.clear_basic_filter()
     worksheet.update(values=final_data, range_name='A1')
     
-    # 5. BATCH FORMATTING (TRUE FIX FOR 429 ERROR)
-    # ---------------------------------------------------------
-    # First, we merge the cells via the raw API payload
+    # 5. BATCH FORMATTING
     requests_payload = [{"unmergeCells": {"range": {"sheetId": worksheet.id, "startRowIndex": 0, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 50}}}]
     
     col_idx = 1
@@ -334,11 +350,9 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     if requests_payload:
         spreadsheet.batch_update({"requests": requests_payload})
         
-    # Second, we compile ALL color formatting into a single list of rules
     end_col = col_to_letter(1 + (len(CITIES) * 4))
     formatting_rules = []
     
-    # Header format rule
     formatting_rules.append((f'A1:{end_col}2', cellFormat(textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
     
     col_idx = 2
@@ -353,12 +367,10 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         formatting_rules.append((f'{cust1}3:{cust2}{len(items_to_track)+2}', cellFormat(backgroundColor=color(0.97, 0.97, 0.97))))
         col_idx += 4
         
-    # Group row colors to apply efficiently
     for current_row, item in enumerate(items_to_track, start=3):
         row_color = get_row_color(item)
         formatting_rules.append((f'A{current_row}:{end_col}{current_row}', cellFormat(backgroundColor=row_color)))
 
-    # Finally, we execute the entire list in exactly ONE API call
     if formatting_rules:
         format_cell_ranges(worksheet, formatting_rules)
 
