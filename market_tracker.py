@@ -43,13 +43,10 @@ RESOURCE_COLORS = {
 # MODULE 2: HELPER UTILITIES
 # ==========================================
 def generate_tracking_list():
-    """Generates items GROUPED BY RESOURCE rather than by tier."""
     generated = []
-    # Loop resource first, then tier, so all stones are grouped, all logs grouped, etc.
     for res in BASE_RESOURCES + REFINED_RESOURCES:
         for tier in range(MIN_TIER, MAX_TIER + 1):
             generated.append(f"tier {tier} {res}")
-            
     combined = generated + EXTRA_ITEMS_TO_TRACK
     return list(dict.fromkeys(combined))
 
@@ -221,7 +218,11 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             elif profit_from_c > 0:
                 caerleon_routes.append([item, "Caerleon", c_price, best_safe_sell, safe_sell_price, profit_from_c, safe_sell_vol])
 
-        # --- HYBRID CUSTOM ROUTES (With Priority Logic) ---
+        # --- HYBRID CUSTOM ROUTES ---
+        best_custom_profit = 0
+        best_custom_route = None
+        has_true_custom_pair = False
+        
         for b_city in CITIES:
             for s_city in CITIES:
                 if b_city == s_city: continue
@@ -233,40 +234,47 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                 avg_sell = market_data.get((uid, s_city), {}).get('price', 0)
                 s_vol = market_data.get((uid, s_city), {}).get('volume', 0)
                 
+                is_true_pair = (c_buy > 0 and c_sell > 0)
                 actual_buy = c_buy if c_buy > 0 else avg_buy
                 actual_sell = c_sell if c_sell > 0 else avg_sell
                 
                 if actual_buy == 0 or actual_sell == 0 or s_vol == 0: continue
                 profit = int((actual_sell * 0.895) - actual_buy)
                 
-                notes = []
-                if c_buy == 0: notes.append(f"Avg Buy used for {b_city}")
-                if c_sell == 0: notes.append(f"Avg Sell used for {s_city}")
-                note_str = "PRIORITY: Custom Pair" if (c_buy > 0 and c_sell > 0) else ", ".join(notes)
+                should_update = False
+                if is_true_pair and not has_true_custom_pair:
+                    should_update = True 
+                    has_true_custom_pair = True
+                elif is_true_pair and has_true_custom_pair and profit > best_custom_profit:
+                    should_update = True 
+                elif not has_true_custom_pair and profit > best_custom_profit:
+                    should_update = True 
                 
-                route_data = [item, b_city, actual_buy, s_city, actual_sell, profit, s_vol, note_str]
-                
-                # Separate out pure custom interactions from absolute fallbacks
-                if c_buy > 0 or c_sell > 0:
-                    if profit > 0:
-                        custom_routes.append(route_data)
+                if should_update:
+                    best_custom_profit = profit
+                    notes = []
+                    if c_buy == 0: notes.append(f"Avg Buy used for {b_city}")
+                    if c_sell == 0: notes.append(f"Avg Sell used for {s_city}")
+                    
+                    note_str = "PRIORITY: Custom Pair" if is_true_pair else ", ".join(notes)
+                    best_custom_route = [item, b_city, actual_buy, s_city, actual_sell, profit, s_vol, note_str]
+                    
+        if best_custom_route:
+            if "PRIORITY" in best_custom_route[-1] or "Avg Buy" in best_custom_route[-1] or "Avg Sell" in best_custom_route[-1]:
+                if any(custom_inputs.get((item, c), {}).get(t, 0) > 0 for c in CITIES for t in ['buy', 'sell']):
+                    custom_routes.append(best_custom_route)
                 else:
-                    if profit > 0:
-                        custom_routes_pure_fallback.append(route_data)
+                    custom_routes_pure_fallback.append(best_custom_route)
 
-    # 4. BUILD THE GRID (Applying Top 5 rules)
+    # 4. BUILD THE GRID
     route_columns = ["Item", "Buy At", "Buy Price", "Sell At", "Sell Price", "Net Profit (After Tax)", "Daily Vol"]
-    custom_cols = route_columns + ["Notes (Fallback Status)"]
-    
-    # Restrict Safe and Caerleon to Top 5 ONLY
     safe_df = pd.DataFrame(safe_routes, columns=route_columns).sort_values(by="Net Profit (After Tax)", ascending=False).head(5)
     caerleon_df = pd.DataFrame(caerleon_routes, columns=route_columns).sort_values(by="Net Profit (After Tax)", ascending=False).head(5)
     
-    # Custom Logic: No limit if custom values exist. Fallback to Top 5 avg if none exist.
+    custom_cols = route_columns + ["Notes (Fallback Status)"]
     if len(custom_routes) > 0:
         custom_df = pd.DataFrame(custom_routes, columns=custom_cols).sort_values(by="Net Profit (After Tax)", ascending=False)
     else:
-        # Fallback scenario
         custom_df = pd.DataFrame(custom_routes_pure_fallback, columns=custom_cols).sort_values(by="Net Profit (After Tax)", ascending=False).head(5)
     
     header_row_1 = ["Item Name"]
@@ -308,7 +316,9 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     worksheet.clear_basic_filter()
     worksheet.update(values=final_data, range_name='A1')
     
-    # 5. BATCH FORMATTING
+    # 5. BATCH FORMATTING (TRUE FIX FOR 429 ERROR)
+    # ---------------------------------------------------------
+    # First, we merge the cells via the raw API payload
     requests_payload = [{"unmergeCells": {"range": {"sheetId": worksheet.id, "startRowIndex": 0, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 50}}}]
     
     col_idx = 1
@@ -324,43 +334,33 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     if requests_payload:
         spreadsheet.batch_update({"requests": requests_payload})
         
+    # Second, we compile ALL color formatting into a single list of rules
     end_col = col_to_letter(1 + (len(CITIES) * 4))
-    formats = []
-    formats.append(format_cell_range(worksheet, f'A1:{end_col}2', cellFormat(textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
+    formatting_rules = []
+    
+    # Header format rule
+    formatting_rules.append((f'A1:{end_col}2', cellFormat(textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
     
     col_idx = 2
     for city in CITIES:
         bg_color = CITY_COLORS.get(city, color(1.0, 1.0, 1.0))
         letter1 = col_to_letter(col_idx)
         letter2 = col_to_letter(col_idx + 3)
-        formats.append(format_cell_range(worksheet, f'{letter1}1:{letter2}{len(items_to_track)+2}', cellFormat(backgroundColor=bg_color)))
+        formatting_rules.append((f'{letter1}1:{letter2}{len(items_to_track)+2}', cellFormat(backgroundColor=bg_color)))
         
         cust1 = col_to_letter(col_idx + 2)
         cust2 = col_to_letter(col_idx + 3)
-        formats.append(format_cell_range(worksheet, f'{cust1}3:{cust2}{len(items_to_track)+2}', cellFormat(backgroundColor=color(0.97, 0.97, 0.97))))
-        
+        formatting_rules.append((f'{cust1}3:{cust2}{len(items_to_track)+2}', cellFormat(backgroundColor=color(0.97, 0.97, 0.97))))
         col_idx += 4
         
-    color_groups = {}
-    current_row = 3
-    for item in items_to_track:
+    # Group row colors to apply efficiently
+    for current_row, item in enumerate(items_to_track, start=3):
         row_color = get_row_color(item)
-        color_key = (row_color.red, row_color.green, row_color.blue)
-        if color_key not in color_groups:
-            color_groups[color_key] = []
-        color_groups[color_key].append(current_row)
-        current_row += 1
+        formatting_rules.append((f'A{current_row}:{end_col}{current_row}', cellFormat(backgroundColor=row_color)))
 
-    for color_key, rows in color_groups.items():
-        c_obj = color(color_key[0], color_key[1], color_key[2])
-        for row in rows:
-            formats.append(format_cell_range(worksheet, f'A{row}:{end_col}{row}', cellFormat(backgroundColor=c_obj)))
-
-    worksheet.spreadsheet.batch_update({'requests': [f for f in formats if isinstance(f, dict)]})
-    try:
-        format_cell_ranges(worksheet, [(k, v) for k, v in zip([f'A1:{end_col}2'] + [f'{col_to_letter(idx)}1:{col_to_letter(idx+3)}{len(items_to_track)+2}' for idx in range(2, len(CITIES)*4+2, 4)] + [f'{col_to_letter(idx+2)}3:{col_to_letter(idx+3)}{len(items_to_track)+2}' for idx in range(2, len(CITIES)*4+2, 4)] + [f'A{row}:{end_col}{row}' for row in range(3, len(items_to_track)+3)], [cellFormat(textFormat=textFormat(bold=True), horizontalAlignment='CENTER')] + [cellFormat(backgroundColor=CITY_COLORS.get(c, color(1.0, 1.0, 1.0))) for c in CITIES] + [cellFormat(backgroundColor=color(0.97, 0.97, 0.97)) for c in CITIES] + [get_row_color(item) for item in items_to_track])])
-    except:
-        pass
+    # Finally, we execute the entire list in exactly ONE API call
+    if formatting_rules:
+        format_cell_ranges(worksheet, formatting_rules)
 
 def main():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
