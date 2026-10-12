@@ -8,6 +8,10 @@ import pandas as pd
 from datetime import datetime
 import re
 
+# ==========================================
+# MODULE 1: CONFIGURATION & STYLING
+# Defines the targeted cities and the color codes for the sheet
+# ==========================================
 CITIES = ["Martlock", "Caerleon", "Lymhurst", "Bridgewatch", "Thetford", "Fort Sterling"]
 SHEET_NAME = "Albion Market Tracker"
 
@@ -28,7 +32,12 @@ RESOURCE_COLORS = {
     "rock": color(0.9, 0.9, 0.9), "stone": color(0.9, 0.9, 0.9), "block": color(0.9, 0.9, 0.9)
 }
 
+# ==========================================
+# MODULE 2: HELPER UTILITIES
+# Functions to translate column numbers, map item names, and assign colors
+# ==========================================
 def col_to_letter(col):
+    """Converts a column number to an Excel letter (1 -> A, 2 -> B)"""
     result = ""
     while col > 0:
         col, remainder = divmod(col - 1, 26)
@@ -36,6 +45,7 @@ def col_to_letter(col):
     return result
 
 def get_item_mapping():
+    """Fetches the official Albion item dictionary to map English names to internal IDs"""
     url = "https://raw.githubusercontent.com/broderickhyman/ao-bin-dumps/master/formatted/items.json"
     mapping = {}
     try:
@@ -51,6 +61,7 @@ def get_item_mapping():
     return mapping
 
 def parse_item_name(name, mapping):
+    """Parses user input (e.g., 'tier 4 hide') into the game's internal ID (e.g., 'T4_HIDE')"""
     name_lower = name.lower().strip()
     if name_lower in mapping:
         return mapping[name_lower]
@@ -69,17 +80,26 @@ def parse_item_name(name, mapping):
     return name.upper()
 
 def get_row_color(item_name):
+    """Determines the background color for an item row based on its resource type"""
     name_lower = item_name.lower()
     for key, c in RESOURCE_COLORS.items():
         if key in name_lower:
             return c
     return color(1.0, 1.0, 1.0)
 
+# ==========================================
+# MODULE 3: API COMMUNICATION
+# Fetches the accurate 24-hour average price and daily volume from the Albion API
+# ==========================================
 def fetch_history_data(item_ids, server):
     url = f"https://{server}.albion-online-data.com/api/v2/stats/history/{','.join(item_ids)}?locations={','.join(CITIES)}&time-scale=24"
     res = requests.get(url)
     return res.json() if res.status_code == 200 else []
 
+# ==========================================
+# MODULE 4: GOOGLE SHEETS PROCESSING
+# Handles reading user input, processing API data, and writing/formatting the sheet
+# ==========================================
 def update_server_tab(client, spreadsheet, server_name, server_code, global_mapping):
     try:
         worksheet = spreadsheet.worksheet(server_name)
@@ -110,6 +130,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     if not target_ids:
         return
         
+    # Fetch exact accurate history data
     history_data = fetch_history_data(target_ids, server=server_code)
     
     market_data = {} 
@@ -145,6 +166,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     best_df = pd.DataFrame(best_routes, columns=["Item", "Buy At", "Avg Buy Price", "Sell At", "Avg Sell Price", "Net Profit (After Tax)", "Daily Vol"])
     best_df = best_df.sort_values(by="Net Profit (After Tax)", ascending=False)
     
+    # Structure Headers (2 Columns per City: Avg Price & Volume)
     header_row_1 = ["Item Name"]
     header_row_2 = [""]
     
@@ -173,9 +195,10 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     worksheet.clear_basic_filter()
     worksheet.update(values=final_data, range_name='A1')
     
+    # Apply precise styling and merging logic to protect city names
     requests_payload = []
     
-    # Clean old merged cells
+    # Completely unmerge all headers to prevent disappearing city names
     requests_payload.append({
         "unmergeCells": {
             "range": {
@@ -224,6 +247,10 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         format_cell_range(worksheet, f'A{current_row}:{end_col}{current_row}', cellFormat(backgroundColor=row_color))
         current_row += 1
 
+# ==========================================
+# MODULE 5: MAIN EXECUTION
+# Initializes Google credentials and runs the update for both servers
+# ==========================================
 def main():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     creds_dict = json.loads(creds_json)
@@ -238,8 +265,13 @@ def main():
         
     global_mapping = get_item_mapping()
         
+    print("Updating Americas Tab...")
     update_server_tab(client, spreadsheet, "Americas", "west", global_mapping)
+    
+    print("Updating Asia Tab...")
     update_server_tab(client, spreadsheet, "Asia", "east", global_mapping)
+    
+    print("Update Complete!")
 
 if __name__ == "__main__":
     main()
