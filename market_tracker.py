@@ -123,6 +123,15 @@ def extract_clean_tokens(raw_cell_list):
                 tokens.append(cleaned)
     return tokens
 
+def extract_top_n(raw_cell_list):
+    for cell_val in raw_cell_list:
+        if not cell_val:
+            continue
+        digits = re.sub(r'[^\d]', '', str(cell_val))
+        if digits and int(digits) > 0:
+            return int(digits)
+    return None
+
 def matches_multi_filter(item_name, item_tokens, tier_tokens):
     name_low = item_name.lower().strip()
     
@@ -148,27 +157,38 @@ def matches_multi_filter(item_name, item_tokens, tier_tokens):
             
     return True
 
+def matches_city_filter(city_name, city_tokens):
+    if not city_tokens:
+        return True
+    c_low = city_name.lower().strip()
+    for token in city_tokens:
+        if token in c_low or c_low in token:
+            return True
+    return False
+
 # ==========================================
 # MODULE 3: NON-DESTRUCTIVE SHEET PROCESSING
-# Role: Safely backs up custom data and multi-row filter columns, calculates routes, and updates cells.
+# Role: Backs up custom inputs & filters, builds vertical & horizontal tables, and updates cells cleanly.
 # ==========================================
 def update_server_tab(client, spreadsheet, server_name, server_code, global_mapping):
     try:
         worksheet = spreadsheet.worksheet(server_name)
         existing_data = worksheet.get_all_values()
     except gspread.exceptions.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=server_name, rows="350", cols="32")
+        worksheet = spreadsheet.add_worksheet(title=server_name, rows="400", cols="35")
         existing_data = []
 
-    if worksheet.col_count < 30:
-        worksheet.resize(rows=max(worksheet.row_count, 350), cols=32)
+    if worksheet.col_count < 35 or worksheet.row_count < 400:
+        worksheet.resize(rows=max(worksheet.row_count, 400), cols=max(worksheet.col_count, 35))
 
     items_to_track = generate_tracking_list()
     custom_inputs = {} 
     
-    # Multi-cell column preservation lists (Columns AA to AD, starting at Row 3)
+    # Multi-cell column preservation lists (Columns AA to AF, indices 26 to 31)
     custom_filter_items_col = []
     custom_filter_tiers_col = []
+    custom_filter_cities_col = []
+    custom_top_n_col = []
     api_filter_items_col = []
     api_filter_tiers_col = []
     
@@ -193,19 +213,38 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                 if "Custom Buy" in val: city_cols[curr_city]['buy'] = idx
                 if "Custom Sell" in val: city_cols[curr_city]['sell'] = idx
 
+        # Map dynamic filter columns by header name so previous AA:AD data shifts seamlessly without loss
+        f_col_map = {
+            'c_item': 26, 'c_tier': 27, 'c_city': None, 'c_top': None,
+            'a_item': 28, 'a_tier': 29
+        }
+        for idx in range(25, len(headers2)):
+            h_val = headers2[idx].strip().lower()
+            if "custom filter item" in h_val: f_col_map['c_item'] = idx
+            elif "custom filter tier" in h_val: f_col_map['c_tier'] = idx
+            elif "custom filter city" in h_val: f_col_map['c_city'] = idx
+            elif "custom top" in h_val: f_col_map['c_top'] = idx
+            elif "api filter item" in h_val: f_col_map['a_item'] = idx
+            elif "api filter tier" in h_val: f_col_map['a_tier'] = idx
+
         for row in existing_data[2:]:
             if not row: break
             item_name = row[0].strip()
-            if not item_name or "CUSTOM USER" in item_name or "SAFE CITIES" in item_name or "CAERLEON" in item_name or "BEST LIQUIDATION" in item_name or item_name.startswith("#ERROR"):
+            if not item_name or "CUSTOM USER" in item_name or "SAFE CITIES" in item_name or "CAERLEON" in item_name or "BEST LIQUIDATION" in item_name or item_name.startswith("#ERROR") or item_name.startswith("---"):
                 break
             if item_name not in items_to_track:
                 items_to_track.append(item_name)
                 
-            # Read filter cells for this row across Columns AA to AD (indices 26 to 29)
-            custom_filter_items_col.append(row[26].strip() if len(row) > 26 else "")
-            custom_filter_tiers_col.append(row[27].strip() if len(row) > 27 else "")
-            api_filter_items_col.append(row[28].strip() if len(row) > 28 else "")
-            api_filter_tiers_col.append(row[29].strip() if len(row) > 29 else "")
+            def get_f_val(key):
+                c_i = f_col_map.get(key)
+                return row[c_i].strip() if c_i is not None and c_i < len(row) else ""
+
+            custom_filter_items_col.append(get_f_val('c_item'))
+            custom_filter_tiers_col.append(get_f_val('c_tier'))
+            custom_filter_cities_col.append(get_f_val('c_city'))
+            custom_top_n_col.append(get_f_val('c_top'))
+            api_filter_items_col.append(get_f_val('a_item'))
+            api_filter_tiers_col.append(get_f_val('a_tier'))
                 
             for city, cols in city_cols.items():
                 b_idx = cols['buy']
@@ -243,16 +282,21 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     custom_caerleon_routes = []
     
     custom_safe_liq = []
+    custom_city_specific_liq = []
     custom_caerleon_liq = []
     api_safe_liq = []
     api_caerleon_liq = []
     
     c_item_tokens = extract_clean_tokens(custom_filter_items_col)
     c_tier_tokens = extract_clean_tokens(custom_filter_tiers_col)
+    c_city_tokens = extract_clean_tokens(custom_filter_cities_col)
+    custom_top_n = extract_top_n(custom_top_n_col)
+    
     a_item_tokens = extract_clean_tokens(api_filter_items_col)
     a_tier_tokens = extract_clean_tokens(api_filter_tiers_col)
     
     custom_filter_active = bool(c_item_tokens or c_tier_tokens)
+    custom_city_filter_active = bool(c_city_tokens)
     api_filter_active = bool(a_item_tokens or a_tier_tokens)
     safe_city_names = [c for c in CITIES if c != "Caerleon"]
     
@@ -261,7 +305,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         valid_cities = [c for c in CITIES if market_data.get((uid, c), {}).get("price", 0) > 0 and market_data.get((uid, c), {}).get("volume", 0) > 0]
         safe_cities = [c for c in valid_cities if c != "Caerleon"]
         
-        # 1. SAFE CITIES LIQUIDATION (Multi-Item & Multi-Tier Filter Check)
+        # 1A. VERTICAL BOX: SAFE CITIES CUSTOM LIQUIDATION (Item/Tier Filter)
         if custom_filter_active:
             if matches_multi_filter(item, c_item_tokens, c_tier_tokens):
                 for c in safe_city_names:
@@ -286,6 +330,16 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             if has_any_safe_custom:
                 custom_safe_liq.append([item, best_safe_custom_city, best_safe_custom_price, best_safe_custom_api_fallback])
 
+        # 1B. HORIZONTAL BOX: CITY-SPECIFIC CUSTOM LIQUIDATION BREAKDOWN
+        if matches_multi_filter(item, c_item_tokens, c_tier_tokens):
+            for c in CITIES:
+                if matches_city_filter(c, c_city_tokens):
+                    c_buy = custom_inputs.get((item, c), {}).get('buy_num', 0)
+                    api_avg = market_data.get((uid, c), {}).get('price', 0)
+                    if c_buy > 0:
+                        custom_city_specific_liq.append([item, c, c_buy, api_avg])
+
+        # 1C. API SAFE CITIES LIQUIDATION
         if api_filter_active:
             if matches_multi_filter(item, a_item_tokens, a_tier_tokens):
                 for c in safe_cities:
@@ -419,12 +473,33 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     else:
         custom_df = safe_df.copy()
         
-    safe_custom_liq_df = pd.DataFrame(custom_safe_liq, columns=liq_columns).sort_values(by="Custom Buy Order", ascending=False) if len(custom_safe_liq) > 0 else pd.DataFrame()
-    caerleon_custom_liq_df = pd.DataFrame(custom_caerleon_liq, columns=liq_columns).sort_values(by="Custom Buy Order", ascending=False) if len(custom_caerleon_liq) > 0 else pd.DataFrame()
+    # Apply sorting and Top N limits to Custom Liquidation DataFrames
+    if len(custom_safe_liq) > 0:
+        safe_custom_liq_df = pd.DataFrame(custom_safe_liq, columns=liq_columns).sort_values(by="Custom Buy Order", ascending=False)
+        if custom_top_n:
+            safe_custom_liq_df = safe_custom_liq_df.head(custom_top_n)
+    else:
+        safe_custom_liq_df = pd.DataFrame()
+
+    if len(custom_city_specific_liq) > 0:
+        city_specific_custom_df = pd.DataFrame(custom_city_specific_liq, columns=liq_columns).sort_values(by="Custom Buy Order", ascending=False)
+        if custom_top_n:
+            city_specific_custom_df = city_specific_custom_df.head(custom_top_n)
+    else:
+        city_specific_custom_df = pd.DataFrame()
+
+    if len(custom_caerleon_liq) > 0:
+        caerleon_custom_liq_df = pd.DataFrame(custom_caerleon_liq, columns=liq_columns).sort_values(by="Custom Buy Order", ascending=False)
+        if custom_top_n:
+            caerleon_custom_liq_df = caerleon_custom_liq_df.head(custom_top_n)
+    else:
+        caerleon_custom_liq_df = pd.DataFrame()
     
     if len(api_safe_liq) > 0:
         safe_api_liq_df = pd.DataFrame(api_safe_liq, columns=liq_columns).sort_values(by="API Avg Price", ascending=False)
-        if not api_filter_active:
+        if custom_top_n and api_filter_active:
+            safe_api_liq_df = safe_api_liq_df.head(custom_top_n)
+        elif not api_filter_active:
             safe_api_liq_df = safe_api_liq_df.head(10)
     else:
         safe_api_liq_df = pd.DataFrame()
@@ -438,9 +513,9 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         header_row_1.extend([city, "", "", ""])
         header_row_2.extend(["Avg Price", "Volume", "Custom Buy Order", "Custom Sell Order"])
         
-    # Append Filter Panel Headers in Columns AA to AD (Indices 26 to 29)
-    header_row_1.extend(["", "LIQUIDATION TRACKER FILTERS", "", "", ""])
-    header_row_2.extend(["", "Custom Filter Item", "Custom Filter Tier", "API Filter Item", "API Filter Tier"])
+    # Append Filter Panel Headers in Columns AA to AF (Indices 26 to 31)
+    header_row_1.extend(["", "LIQUIDATION TRACKER FILTERS", "", "", "", "", ""])
+    header_row_2.extend(["", "Custom Filter Item", "Custom Filter Tier", "Custom Filter City", "Custom Top N", "API Filter Item", "API Filter Tier"])
         
     final_data = [header_row_1, header_row_2]
     
@@ -456,41 +531,107 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             
             row.extend([price, vol, c_buy_str, c_sell_str])
             
-        # Preserve User Filter Inputs across every row in Columns AA to AD
+        # Preserve User Filter Inputs across every row in Columns AA to AF
         c_f_item_val = custom_filter_items_col[idx] if idx < len(custom_filter_items_col) else ""
         c_f_tier_val = custom_filter_tiers_col[idx] if idx < len(custom_filter_tiers_col) else ""
+        c_f_city_val = custom_filter_cities_col[idx] if idx < len(custom_filter_cities_col) else ""
+        c_f_top_val = custom_top_n_col[idx] if idx < len(custom_top_n_col) else ""
         a_f_item_val = api_filter_items_col[idx] if idx < len(api_filter_items_col) else ""
         a_f_tier_val = api_filter_tiers_col[idx] if idx < len(api_filter_tiers_col) else ""
         
-        row.extend(["", c_f_item_val, c_f_tier_val, a_f_item_val, a_f_tier_val])
+        row.extend(["", c_f_item_val, c_f_tier_val, c_f_city_val, c_f_top_val, a_f_item_val, a_f_tier_val])
         final_data.append(row)
         
-    def append_table(title, df):
+    def append_vertical_table(title, df):
         if df is None or df.empty: return
+        final_data.append([])
         final_data.append([])
         final_data.append([title])
         final_data.append(list(df.columns))
         clean_df = df.astype(object).where(pd.notnull(df), None)
         final_data.extend(clean_df.values.tolist())
 
-    custom_liq_title = "BEST LIQUIDATION (CUSTOM): SAFE CITIES [FILTERED ALL CITIES]" if custom_filter_active else "BEST LIQUIDATION (CUSTOM): SAFE CITIES"
+    def append_horizontal_table_group(tables_info):
+        valid_tables = [(t, d) for t, d in tables_info if d is not None and not d.empty]
+        if not valid_tables: return
+        final_data.append([])
+        final_data.append([])
+        
+        title_row = []
+        col_header_row = []
+        cleaned_rows_list = []
+        max_rows = 0
+        
+        for idx_t, (title, df) in enumerate(valid_tables):
+            num_cols = len(df.columns)
+            title_row.extend([title] + [""] * (num_cols - 1))
+            col_header_row.extend(list(df.columns))
+            if idx_t < len(valid_tables) - 1:
+                title_row.append("")
+                col_header_row.append("")
+                
+            clean_df = df.astype(object).where(pd.notnull(df), None)
+            rows_data = clean_df.values.tolist()
+            cleaned_rows_list.append((rows_data, num_cols))
+            if len(rows_data) > max_rows:
+                max_rows = len(rows_data)
+                
+        final_data.append(title_row)
+        final_data.append(col_header_row)
+        
+        for r_idx in range(max_rows):
+            combined_row = []
+            for idx_t, (rows_data, num_cols) in enumerate(cleaned_rows_list):
+                if r_idx < len(rows_data):
+                    combined_row.extend(rows_data[r_idx])
+                else:
+                    combined_row.extend([""] * num_cols)
+                if idx_t < len(cleaned_rows_list) - 1:
+                    combined_row.append("")
+            final_data.append(combined_row)
+
+    # Dynamic Titles
+    top_tag = f" (Top {custom_top_n})" if custom_top_n else ""
+    custom_liq_title = f"BEST LIQUIDATION (CUSTOM): SAFE CITIES [FILTERED]{top_tag}" if custom_filter_active else f"BEST LIQUIDATION (CUSTOM): SAFE CITIES{top_tag}"
+    
+    if custom_city_filter_active:
+        city_label = ", ".join([c.title() for c in c_city_tokens])
+        if c_tier_tokens and not c_item_tokens:
+            city_box_title = f"CITY FILTER [{city_label}]: HIGHEST ITEM IN TIER{top_tag}"
+        elif c_item_tokens and not c_tier_tokens:
+            city_box_title = f"CITY FILTER [{city_label}]: HIGHEST TIER OF ITEM{top_tag}"
+        elif c_item_tokens and c_tier_tokens:
+            city_box_title = f"CITY FILTER [{city_label}]: MATCHING ITEM & TIER{top_tag}"
+        else:
+            city_box_title = f"CITY FILTER [{city_label}]: HIGHEST PRICED ITEMS{top_tag}"
+    else:
+        city_box_title = f"ALL CITIES CUSTOM BREAKDOWN (HIGHEST TO LOWEST){top_tag}"
+
     api_liq_title = "BEST LIQUIDATION (API): SAFE CITIES [FILTERED ALL CITIES]" if api_filter_active else "BEST LIQUIDATION (API): SAFE CITIES (Top 10)"
 
-    append_table("CUSTOM USER ROUTES (Hybrid)", custom_df)
-    append_table("SAFE CITIES API ROUTES (Top 5)", safe_df)
-    append_table("CAERLEON (RED ZONE) API ROUTES (Top 5)", caerleon_df)
-    append_table(custom_liq_title, safe_custom_liq_df)
-    append_table("BEST LIQUIDATION (CUSTOM): CAERLEON", caerleon_custom_liq_df)
-    append_table(api_liq_title, safe_api_liq_df)
-    append_table("BEST LIQUIDATION (API): CAERLEON (Top 10)", caerleon_api_liq_df)
+    # 1. Vertical Route Tables
+    append_vertical_table("CUSTOM USER ROUTES (Hybrid)", custom_df)
+    append_vertical_table("SAFE CITIES API ROUTES (Top 5)", safe_df)
+    append_vertical_table("CAERLEON (RED ZONE) API ROUTES (Top 5)", caerleon_df)
+    
+    # 2. Horizontal Custom Liquidation Section (Box 1 in Cols A:D, Spacer Col E, Box 2 in Cols F:I)
+    append_horizontal_table_group([
+        (custom_liq_title, safe_custom_liq_df),
+        (city_box_title, city_specific_custom_df)
+    ])
+    
+    # 3. Remaining Vertical Liquidation Tables (Properly spaced so they never mix)
+    append_vertical_table(f"BEST LIQUIDATION (CUSTOM): CAERLEON{top_tag}", caerleon_custom_liq_df)
+    append_vertical_table(api_liq_title, safe_api_liq_df)
+    append_vertical_table("BEST LIQUIDATION (API): CAERLEON (Top 10)", caerleon_api_liq_df)
         
-    # 5. NON-DESTRUCTIVE WRITE
+    # 5. NON-DESTRUCTIVE WRITE (Clears summary zone first so old rows never mix with new tables)
+    summary_start_row = len(items_to_track) + 3
+    worksheet.batch_clear([f'A{summary_start_row}:AF1000'])
     worksheet.update(values=final_data, range_name='A1', value_input_option='USER_ENTERED')
-    new_row_count = len(final_data)
-    worksheet.batch_clear([f'A{new_row_count + 1}:AD1000'])
     
     # 6. BATCH FORMATTING
-    requests_payload = [{"unmergeCells": {"range": {"sheetId": worksheet.id, "startRowIndex": 0, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 31}}}]
+    requests_payload = [{"unmergeCells": {"range": {"sheetId": worksheet.id, "startRowIndex": 0, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 34}}}]
     
     col_idx = 1
     for city in CITIES:
@@ -502,10 +643,10 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         })
         col_idx += 4
         
-    # Merge Filter Header Banner (AA1:AD1)
+    # Merge Filter Header Banner (AA1:AF1 -> indices 26 to 32)
     requests_payload.append({
         "mergeCells": {
-            "range": {"sheetId": worksheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 26, "endColumnIndex": 30},
+            "range": {"sheetId": worksheet.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 26, "endColumnIndex": 32},
             "mergeType": "MERGE_ALL"
         }
     })
@@ -516,9 +657,12 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     end_col = col_to_letter(1 + (len(CITIES) * 4))
     formatting_rules = []
     
-    formatting_rules.append(('A1:AD2', cellFormat(textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
-    formatting_rules.append(('AA1:AD2', cellFormat(backgroundColor=color(0.85, 0.92, 0.98), textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
-    formatting_rules.append((f'AA3:AD{len(items_to_track)+2}', cellFormat(backgroundColor=color(1.0, 0.98, 0.8), textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
+    # Clear old background colors in the summary section so shifted tables look clean
+    formatting_rules.append((f'A{summary_start_row}:AF{len(final_data)+15}', cellFormat(backgroundColor=color(1.0, 1.0, 1.0), textFormat=textFormat(bold=False))))
+    
+    formatting_rules.append(('A1:AF2', cellFormat(textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
+    formatting_rules.append(('AA1:AF2', cellFormat(backgroundColor=color(0.85, 0.92, 0.98), textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
+    formatting_rules.append((f'AA3:AF{len(items_to_track)+2}', cellFormat(backgroundColor=color(1.0, 0.98, 0.8), textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
     
     col_idx = 2
     for city in CITIES:
