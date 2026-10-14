@@ -42,7 +42,7 @@ RESOURCE_COLORS = {
 
 # ==========================================
 # MODULE 2: HELPER UTILITIES
-# Role: Handles item ID translation, API requests, filter matching, and viability math.
+# Role: Handles item ID translation, API requests, multi-cell filter matching, and viability math.
 # ==========================================
 def generate_tracking_list():
     generated = []
@@ -112,23 +112,45 @@ def calculate_sell_viability(profit, buy_price, vol):
     elif vol >= 500 and margin_pct >= 5: return "Good"
     else: return "Moderate"
 
-def matches_filter(item_name, f_item, f_tier):
+def extract_clean_tokens(raw_cell_list):
+    tokens = []
+    for cell_val in raw_cell_list:
+        if not cell_val:
+            continue
+        for part in str(cell_val).split(','):
+            cleaned = part.strip().lower()
+            if cleaned:
+                tokens.append(cleaned)
+    return tokens
+
+def matches_multi_filter(item_name, item_tokens, tier_tokens):
     name_low = item_name.lower().strip()
-    if f_tier:
-        t_digits = re.sub(r'[^\d]', '', f_tier)
-        if t_digits:
-            if not re.search(rf'\b(?:tier\s*{t_digits}|t{t_digits})\b', name_low):
-                return False
-    if f_item:
-        f_item_clean = f_item.lower().strip()
-        item_without_tier = re.sub(r'\b(?:tier\s*\d+|t\d+)\b', '', name_low).strip()
-        if f_item_clean not in item_without_tier and f_item_clean not in name_low:
+    
+    if tier_tokens:
+        tier_matched = False
+        for t_str in tier_tokens:
+            t_digits = re.sub(r'[^\d]', '', t_str)
+            if t_digits and re.search(rf'\b(?:tier\s*{t_digits}|t{t_digits})\b', name_low):
+                tier_matched = True
+                break
+        if not tier_matched:
             return False
+            
+    if item_tokens:
+        item_matched = False
+        item_without_tier = re.sub(r'\b(?:tier\s*\d+|t\d+)\b', '', name_low).strip()
+        for f_item_clean in item_tokens:
+            if f_item_clean in item_without_tier or f_item_clean in name_low:
+                item_matched = True
+                break
+        if not item_matched:
+            return False
+            
     return True
 
 # ==========================================
 # MODULE 3: NON-DESTRUCTIVE SHEET PROCESSING
-# Role: Safely backs up custom data and filters, calculates routes, and updates cells.
+# Role: Safely backs up custom data and multi-row filter columns, calculates routes, and updates cells.
 # ==========================================
 def update_server_tab(client, spreadsheet, server_name, server_code, global_mapping):
     try:
@@ -144,22 +166,15 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     items_to_track = generate_tracking_list()
     custom_inputs = {} 
     
-    # Filter preservation variables (Cells AA3:AD3)
-    custom_filter_item = ""
-    custom_filter_tier = ""
-    api_filter_item = ""
-    api_filter_tier = ""
+    # Multi-cell column preservation lists (Columns AA to AD, starting at Row 3)
+    custom_filter_items_col = []
+    custom_filter_tiers_col = []
+    api_filter_items_col = []
+    api_filter_tiers_col = []
     
     if len(existing_data) >= 3:
         headers1 = existing_data[0]
         headers2 = existing_data[1]
-        
-        # Read filter slots from Row 3 (index 2), Columns AA to AD (indices 26 to 29)
-        row_3 = existing_data[2]
-        if len(row_3) > 26: custom_filter_item = row_3[26].strip()
-        if len(row_3) > 27: custom_filter_tier = row_3[27].strip()
-        if len(row_3) > 28: api_filter_item = row_3[28].strip()
-        if len(row_3) > 29: api_filter_tier = row_3[29].strip()
         
         city_cols = {}
         curr_city = None
@@ -175,17 +190,22 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             if idx < len(headers1) and headers1[idx].strip() in city_cols:
                 curr_city = headers1[idx].strip()
             if curr_city and curr_city in city_cols:
-                # Compatible with both "Custom Buy" and "Custom Buy Order" so data is never lost
                 if "Custom Buy" in val: city_cols[curr_city]['buy'] = idx
                 if "Custom Sell" in val: city_cols[curr_city]['sell'] = idx
 
         for row in existing_data[2:]:
             if not row: break
             item_name = row[0].strip()
-            if not item_name or "CUSTOM USER" in item_name or "SAFE CITIES" in item_name or "CAERLEON" in item_name or "BEST LIQUIDATION" in item_name or item_name.startswith("---") or item_name.startswith("===") or item_name.startswith("#ERROR"):
+            if not item_name or "CUSTOM USER" in item_name or "SAFE CITIES" in item_name or "CAERLEON" in item_name or "BEST LIQUIDATION" in item_name or item_name.startswith("#ERROR"):
                 break
             if item_name not in items_to_track:
                 items_to_track.append(item_name)
+                
+            # Read filter cells for this row across Columns AA to AD (indices 26 to 29)
+            custom_filter_items_col.append(row[26].strip() if len(row) > 26 else "")
+            custom_filter_tiers_col.append(row[27].strip() if len(row) > 27 else "")
+            api_filter_items_col.append(row[28].strip() if len(row) > 28 else "")
+            api_filter_tiers_col.append(row[29].strip() if len(row) > 29 else "")
                 
             for city, cols in city_cols.items():
                 b_idx = cols['buy']
@@ -227,8 +247,13 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     api_safe_liq = []
     api_caerleon_liq = []
     
-    custom_filter_active = bool(custom_filter_item or custom_filter_tier)
-    api_filter_active = bool(api_filter_item or api_filter_tier)
+    c_item_tokens = extract_clean_tokens(custom_filter_items_col)
+    c_tier_tokens = extract_clean_tokens(custom_filter_tiers_col)
+    a_item_tokens = extract_clean_tokens(api_filter_items_col)
+    a_tier_tokens = extract_clean_tokens(api_filter_tiers_col)
+    
+    custom_filter_active = bool(c_item_tokens or c_tier_tokens)
+    api_filter_active = bool(a_item_tokens or a_tier_tokens)
     safe_city_names = [c for c in CITIES if c != "Caerleon"]
     
     for item in items_to_track:
@@ -236,9 +261,9 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         valid_cities = [c for c in CITIES if market_data.get((uid, c), {}).get("price", 0) > 0 and market_data.get((uid, c), {}).get("volume", 0) > 0]
         safe_cities = [c for c in valid_cities if c != "Caerleon"]
         
-        # 1. SAFE CITIES LIQUIDATION (With Active Filter Check)
+        # 1. SAFE CITIES LIQUIDATION (Multi-Item & Multi-Tier Filter Check)
         if custom_filter_active:
-            if matches_filter(item, custom_filter_item, custom_filter_tier):
+            if matches_multi_filter(item, c_item_tokens, c_tier_tokens):
                 for c in safe_city_names:
                     c_buy = custom_inputs.get((item, c), {}).get('buy_num', 0)
                     api_avg = market_data.get((uid, c), {}).get('price', 0)
@@ -262,7 +287,7 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
                 custom_safe_liq.append([item, best_safe_custom_city, best_safe_custom_price, best_safe_custom_api_fallback])
 
         if api_filter_active:
-            if matches_filter(item, api_filter_item, api_filter_tier):
+            if matches_multi_filter(item, a_item_tokens, a_tier_tokens):
                 for c in safe_cities:
                     api_avg = market_data.get((uid, c), {}).get('price', 0)
                     c_buy = custom_inputs.get((item, c), {}).get('buy_num', 0)
@@ -431,9 +456,13 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
             
             row.extend([price, vol, c_buy_str, c_sell_str])
             
-        # Preserve User Filter Inputs in Row 3 (idx == 0 of items loop)
-        if idx == 0:
-            row.extend(["", custom_filter_item, custom_filter_tier, api_filter_item, api_filter_tier])
+        # Preserve User Filter Inputs across every row in Columns AA to AD
+        c_f_item_val = custom_filter_items_col[idx] if idx < len(custom_filter_items_col) else ""
+        c_f_tier_val = custom_filter_tiers_col[idx] if idx < len(custom_filter_tiers_col) else ""
+        a_f_item_val = api_filter_items_col[idx] if idx < len(api_filter_items_col) else ""
+        a_f_tier_val = api_filter_tiers_col[idx] if idx < len(api_filter_tiers_col) else ""
+        
+        row.extend(["", c_f_item_val, c_f_tier_val, a_f_item_val, a_f_tier_val])
         final_data.append(row)
         
     def append_table(title, df):
@@ -444,7 +473,6 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
         clean_df = df.astype(object).where(pd.notnull(df), None)
         final_data.extend(clean_df.values.tolist())
 
-    # Plain text titles (no leading = or -) so Google Sheets never throws #ERROR!
     custom_liq_title = "BEST LIQUIDATION (CUSTOM): SAFE CITIES [FILTERED ALL CITIES]" if custom_filter_active else "BEST LIQUIDATION (CUSTOM): SAFE CITIES"
     api_liq_title = "BEST LIQUIDATION (API): SAFE CITIES [FILTERED ALL CITIES]" if api_filter_active else "BEST LIQUIDATION (API): SAFE CITIES (Top 10)"
 
@@ -488,9 +516,9 @@ def update_server_tab(client, spreadsheet, server_name, server_code, global_mapp
     end_col = col_to_letter(1 + (len(CITIES) * 4))
     formatting_rules = []
     
-    formatting_rules.append((f'A1:AD2', cellFormat(textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
+    formatting_rules.append(('A1:AD2', cellFormat(textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
     formatting_rules.append(('AA1:AD2', cellFormat(backgroundColor=color(0.85, 0.92, 0.98), textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
-    formatting_rules.append(('AA3:AD3', cellFormat(backgroundColor=color(1.0, 0.98, 0.8), textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
+    formatting_rules.append((f'AA3:AD{len(items_to_track)+2}', cellFormat(backgroundColor=color(1.0, 0.98, 0.8), textFormat=textFormat(bold=True), horizontalAlignment='CENTER')))
     
     col_idx = 2
     for city in CITIES:
